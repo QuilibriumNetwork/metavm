@@ -1,0 +1,23 @@
+[package]
+name = "metavm-evm"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+metavm-core = { workspace = true }
+metavm-zkp = { workspace = true }
+revm = { workspace = true }
+sha3 = { workspace = true }
+bls48581 = { workspace = true }
+blst = { workspace = true }
+serde_json = { workspace = true }
+ureq = { workspace = true }
+rayon = { workspace = true }
+
+[[bin]]
+name = "prove-evm"
+path = "src/bin/prove-evm.rs"
+
+[[bin]]
+name = "prove-block"
+path = "src/bin/prove-block.rs"

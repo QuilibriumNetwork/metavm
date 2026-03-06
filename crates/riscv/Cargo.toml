@@ -1,0 +1,26 @@
+[package]
+name = "metavm-riscv"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+metavm-core = { workspace = true }
+metavm-zkp = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+goblin = { workspace = true }
+sha3 = { workspace = true }
+bls48581 = { workspace = true }
+blst = { workspace = true }
+rayon = { workspace = true }
+
+[[bin]]
+name = "prove-boot"
+path = "src/bin/prove-boot.rs"
+
+[[bin]]
+name = "prove-elf"
+path = "src/bin/prove-elf.rs"
+
+[dev-dependencies]
+rand = { workspace = true }

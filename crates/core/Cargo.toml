@@ -1,0 +1,14 @@
+[package]
+name = "metavm-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+curve25519-dalek = { workspace = true }
+rand = { workspace = true }
+sha3 = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }

@@ -1,0 +1,126 @@
+//! Commitment scheme abstraction.
+//!
+//! Defines the [`CommitmentScheme`] trait that abstracts KZG polynomial
+//! commitment operations. Implementations exist for:
+//! - BLS48-581 (via the `bls48581` crate's ceremony SRS)
+//! - BLS12-381 (via `blst` with Ethereum KZG trusted setup)
+
+pub mod bls48581_scheme;
+pub mod bls12381_scheme;
+
+use crate::field::Scalar;
+
+/// Serialized G1 point (commitment or proof).
+#[derive(Clone, Debug)]
+pub struct CommitmentPoint(pub Vec<u8>);
+
+/// Result of a batch opening operation.
+#[derive(Clone, Debug)]
+pub struct BatchOpenResult {
+    pub evaluations: Vec<Scalar>,
+    pub proof: Vec<u8>,
+}
+
+/// Accumulated claim for recursive proof composition.
+#[derive(Clone, Debug)]
+pub struct AccumulatedClaim {
+    /// L_acc compressed G1 point bytes.
+    pub l_acc: Vec<u8>,
+    /// R_acc compressed G1 point bytes.
+    pub r_acc: Vec<u8>,
+    /// Number of proofs folded so far.
+    pub num_folded: u64,
+}
+
+/// Abstract polynomial commitment scheme.
+///
+/// Implementations provide curve-specific KZG operations while the proving
+/// pipeline remains generic. All byte-serialized points use compressed format.
+pub trait CommitmentScheme: Send + Sync {
+    /// Initialize global state (SRS loading, precomputation).
+    fn init(&self);
+
+    /// Size of a compressed G1 point in bytes.
+    fn g1_compressed_size(&self) -> usize;
+
+    /// Maximum supported domain size (number of evaluation points).
+    fn max_domain_size(&self) -> u64;
+
+    // FFT operations
+
+    /// Inverse FFT: evaluation form → coefficient form.
+    fn ifft(&self, evals: &[Scalar], domain_size: u64) -> Vec<Scalar>;
+
+    /// Forward FFT: coefficient form → evaluation form.
+    fn fft(&self, coeffs: &[Scalar], domain_size: u64) -> Vec<Scalar>;
+
+    // Commit operations
+
+    /// Commit to a polynomial in evaluation form.
+    fn commit_evaluations(&self, evals: &[Scalar], domain_size: u64) -> Vec<u8>;
+
+    /// Commit to a polynomial in coefficient form (monomial SRS).
+    fn commit_coefficients(&self, coeffs: &[Scalar]) -> Vec<u8>;
+
+    // Opening operations
+
+    /// Evaluate polynomial (in coefficient form) at arbitrary point z via Horner.
+    fn eval_poly_at(&self, coeffs: &[Scalar], z: &Scalar) -> Scalar;
+
+    /// Synthetic division: (p(x) - p(z)) / (x - z).
+    fn div_by_linear(&self, coeffs: &[Scalar], z: &Scalar) -> Vec<Scalar>;
+
+    /// Open polynomial at arbitrary point z.
+    /// Takes evaluation-form polynomial.
+    /// Returns (y = p(z), proof as compressed G1 bytes).
+    fn open_at_point(&self, eval_form: &[Scalar], z: &Scalar, domain_size: u64) -> (Scalar, Vec<u8>);
+
+    /// Verify single opening: e(C - y*G1, G2) == e(π, [τ]₂ - z*G2).
+    fn verify_at_point(&self, commitment: &[u8], z: &Scalar, y: &Scalar, proof: &[u8]) -> bool;
+
+    /// Batch verify: combine commitments/evaluations with β, single pairing check.
+    fn batch_verify_at_point(
+        &self,
+        commitments: &[&[u8]],
+        evaluations: &[Scalar],
+        z: &Scalar,
+        beta: &Scalar,
+        proof: &[u8],
+    ) -> bool;
+
+    // Recursive accumulator operations
+
+    /// Create an identity (empty) accumulator.
+    fn initial_accumulator(&self) -> AccumulatedClaim;
+
+    /// Compute L and R pairing arguments from commitments, evaluations, z, β, proof.
+    fn compute_lr(
+        &self,
+        commitments: &[&[u8]],
+        evaluations: &[Scalar],
+        z: &Scalar,
+        beta: &Scalar,
+        proof: &[u8],
+    ) -> (Vec<u8>, Vec<u8>);
+
+    /// Fold two accumulators: L_new = L_left + challenge * L_right, etc.
+    fn fold_accumulator(
+        &self,
+        l_left: &[u8],
+        r_left: &[u8],
+        l_right: &[u8],
+        r_right: &[u8],
+        challenge: &Scalar,
+    ) -> (Vec<u8>, Vec<u8>);
+
+    /// Final verification: e(L_acc, G2) == e(R_acc, [τ]₂).
+    fn verify_accumulated(&self, l_acc: &[u8], r_acc: &[u8]) -> bool;
+
+    /// Return the primitive n-th root of unity ω for the given domain size.
+    ///
+    /// ω generates the multiplicative subgroup of order `domain_size`:
+    /// ω^domain_size = 1 and ω^k ≠ 1 for 0 < k < domain_size.
+    /// Used for cross-row (shifted) constraints where column values at ω·X
+    /// represent the "next row" in the evaluation domain.
+    fn domain_generator(&self, domain_size: u64) -> Scalar;
+}
