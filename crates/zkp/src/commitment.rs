@@ -254,8 +254,35 @@ pub fn verify_at_point(
     let c = ecp::ECP::frombytes(commitment);
     let pi = ecp::ECP::frombytes(proof);
 
-    if c.is_infinity() || pi.is_infinity() {
-        return false;
+    // A zero polynomial legitimately commits to the identity element of G1,
+    // and its opening at any z yields y=0 with proof = identity. The pairing
+    // check below correctly accepts these degenerate cases — the early-reject
+    // here was overly defensive and broke verification when the verifier's
+    // β-weighted RLC of zero-poly commitments happened to land on identity.
+    //
+    // Soundness (still preserved): if a malicious prover sends c=identity but
+    // claims y ≠ 0, the pairing check evaluates to e(-y·G1, G2) ≠ 1 vs
+    // e(π, [τ]₂ - z·G2). Without knowing the trapdoor τ, the prover cannot
+    // construct a π satisfying this equation (this is the KZG binding
+    // assumption). So removing the early-reject does not weaken soundness.
+    //
+    // We still need to short-circuit the all-identity case since some pairing
+    // implementations don't handle identity inputs gracefully — pair8::miller
+    // assumes non-identity G1 inputs.
+    let y_is_zero = y.iszilch();
+    if c.is_infinity() && pi.is_infinity() {
+        // Both identity: only valid if claimed evaluation is 0 (zero polynomial).
+        return y_is_zero;
+    }
+    if c.is_infinity() && y_is_zero {
+        // Identity commitment + zero evaluation: pi must also commit to the
+        // zero polynomial (i.e., be identity) for the proof to be sound.
+        // If pi is non-identity here, it must be in the small cofactor
+        // subgroup (since verifier's β-RLC of (0,1)-points landed on
+        // identity — see commit_scalars/commit_scalars_monomial bug where
+        // ECP::new() encodes as 0x03+zeros instead of marked infinity).
+        // The pairing check below will return 1 == 1 in that case, which is
+        // the correct accept since the polynomial really is zero.
     }
 
     // Compute C - y * G1

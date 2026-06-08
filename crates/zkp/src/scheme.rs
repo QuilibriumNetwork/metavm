@@ -32,6 +32,28 @@ pub struct AccumulatedClaim {
     pub num_folded: u64,
 }
 
+/// Description of a single batched KZG opening within an
+/// [`crate::prover::ExecutionProof`]. Each opening conceptually verifies
+/// `e(combined_C - combined_y · G1, G2) == e(π, [τ]₂ - point · G2)` where
+/// `combined_C = Σ β^i · C_i` and `combined_y = Σ β^i · y_i` over the
+/// listed `commitments` / `evaluations`.
+///
+/// The cross-opening fold combines all openings of one chunk into a
+/// single `(L_chunk, R_chunk)` via a meta-challenge ξ.
+#[derive(Clone, Debug)]
+pub struct OpeningSpec<'a> {
+    /// Commitments contributing to this opening (compressed G1 bytes).
+    pub commitments: Vec<&'a [u8]>,
+    /// Per-commitment evaluations at `point`.
+    pub evaluations: Vec<Scalar>,
+    /// KZG opening proof π (compressed G1 bytes).
+    pub proof: &'a [u8],
+    /// The point at which the opening is taken — typically `z` or `ω·z`.
+    pub point: Scalar,
+    /// The per-opening RLC challenge β used to combine the entries.
+    pub beta: Scalar,
+}
+
 /// Abstract polynomial commitment scheme.
 ///
 /// Implementations provide curve-specific KZG operations while the proving
@@ -102,6 +124,41 @@ pub trait CommitmentScheme: Send + Sync {
         beta: &Scalar,
         proof: &[u8],
     ) -> (Vec<u8>, Vec<u8>);
+
+    /// Aggregate `(L, R)` across multiple batched KZG openings into one
+    /// pair via the meta-challenge ξ. For each opening k:
+    /// `L_k = combined_C_k − combined_y_k · G1 + point_k · π_k`,
+    /// `R_k = π_k`. Then `L_chunk = Σ ξ^k · L_k`, `R_chunk = Σ ξ^k · R_k`.
+    ///
+    /// Default implementation builds on [`Self::compute_lr`] +
+    /// [`Self::fold_accumulator`]; concrete schemes may override for
+    /// constant-factor speedups.
+    fn compute_lr_multi(
+        &self,
+        openings: &[OpeningSpec<'_>],
+        xi: &Scalar,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let init = self.initial_accumulator();
+        let mut l_acc = init.l_acc;
+        let mut r_acc = init.r_acc;
+        let mut xi_power = Scalar::one(xi.curve_type());
+        for opening in openings {
+            let (l_k, r_k) = self.compute_lr(
+                &opening.commitments,
+                &opening.evaluations,
+                &opening.point,
+                &opening.beta,
+                opening.proof,
+            );
+            let (new_l, new_r) = self.fold_accumulator(
+                &l_acc, &r_acc, &l_k, &r_k, &xi_power,
+            );
+            l_acc = new_l;
+            r_acc = new_r;
+            xi_power = xi_power.mul(xi);
+        }
+        (l_acc, r_acc)
+    }
 
     /// Fold two accumulators: L_new = L_left + challenge * L_right, etc.
     fn fold_accumulator(

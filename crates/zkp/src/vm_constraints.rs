@@ -238,6 +238,25 @@ pub trait VmConstraintSystem: Send + Sync {
         Vec::new()
     }
 
+    // ── Frame-stack permutation declarations ──────────────────────────────
+
+    /// Layout for the frame-stack LIFO multiset permutation argument.
+    ///
+    /// Returns `Some(layout)` for VMs with nested-call frame stacks (EVM:
+    /// CALL/REVERT/RETURN/etc), `None` for stack-less VMs (RISC-V, SBF).
+    ///
+    /// The layout names trace columns whose values form the per-row
+    /// frame tuple, plus the selector columns that classify each row as
+    /// a frame-PUSH event, a frame-POP event, or neither. The prover
+    /// commits a single Z column whose grand-product closure proves that
+    /// the multiset of pushed frames equals the multiset of popped
+    /// frames.
+    ///
+    /// Default: None.
+    fn frame_perm_layout(&self) -> Option<crate::permutation::FrameStackPermLayout> {
+        None
+    }
+
     // ── Oracle public-input declarations ─────────────────────────────────
 
     /// Column indices for oracle-verified operations.

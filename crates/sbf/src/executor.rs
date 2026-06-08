@@ -83,18 +83,7 @@ fn execute_with_config(
         stack_len,
     );
 
-    let (insn_count, result) = vm.execute_program(executable, true);
-
-    match &result {
-        solana_rbpf::error::ProgramResult::Ok(val) => {
-            eprintln!("[sbf] Program returned: {} (0x{:x})", val, val);
-        }
-        solana_rbpf::error::ProgramResult::Err(e) => {
-            eprintln!("[sbf] Program error: {:?}", e);
-        }
-    }
-    eprintln!("[sbf] Instructions executed: {}", insn_count);
-    eprintln!("[sbf] Trace entries: {}", context.trace_log.len());
+    let (_insn_count, _result) = vm.execute_program(executable, true);
 
     // Get the raw bytecode text section for instruction decoding
     let (text_vaddr, text_bytes) = executable.get_text_bytes();

@@ -126,10 +126,71 @@ fn main() {
         prove_elapsed.as_secs_f64()
     );
 
-    // Wrap in recursive proof and verify
+    // Serialize the chunk proof + emit a one-line size summary plus a
+    // LayerChainProof commitment that binds this proof into the
+    // recursive-fold envelope's public-input root. The envelope
+    // dispatch (`LayerChainProof::verify_with_layer_verifier`) will
+    // recover the same commitment for any caller that consumes the
+    // serialized bytes.
+    let chunk_bytes = chunk_proof.to_bytes();
+    eprintln!(
+        "[prove-evm] Serialized ChunkProof: {} bytes",
+        chunk_bytes.len()
+    );
+    {
+        use metavm_zkp::layer_chain::{
+            ChainBoundaries, LayerChain, LayerChainProof, LayerProof, LayerProofKind,
+        };
+        // Synthetic boundary values — a real production caller would
+        // supply boundary values derived from this transaction's block
+        // and the beacon-chain context. Using deterministic synthetic
+        // values here just demonstrates the envelope wiring.
+        let boundaries = ChainBoundaries {
+            block_hash: [0xBB; 32],
+            beacon_block_root: [0xCC; 32],
+            attestation_data_root: [0xDD; 32],
+            num_attesters: 1,
+            finalized_root: [0xCC; 32],
+            total_effective_balance_gwei: 32_000_000_000,
+        };
+        let chain = LayerChain::from_boundaries(&boundaries);
+        let layers: Vec<LayerProof> = chain
+            .claims
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(i, claim)| {
+                if i == 0 {
+                    LayerProof::with_proof(
+                        claim,
+                        LayerProofKind::VmEvm,
+                        chunk_bytes.clone(),
+                    )
+                } else {
+                    LayerProof::reference_only(claim)
+                }
+            })
+            .collect();
+        let chain_proof = LayerChainProof::new(layers);
+        if let Some(commitment) = chain_proof.commitment() {
+            let mut hex = String::with_capacity(64);
+            for b in &commitment {
+                hex.push_str(&format!("{:02x}", b));
+            }
+            eprintln!("[prove-evm] LayerChain commitment: 0x{}", hex);
+        } else {
+            eprintln!("[prove-evm] LayerChain commitment: <malformed>");
+        }
+        eprintln!(
+            "[prove-evm] LayerChain total proof bytes: {}",
+            chain_proof.total_proof_bytes()
+        );
+    }
+
+    // Wrap in recursive proof and verify.
     let recursive_proof = begin_chunk_scheme(chunk_proof, &*scheme, curve_type);
     let valid = verify_final_scheme(&recursive_proof, &*scheme);
-    eprintln!("[prove-evm] Proof verified: {}", valid);
+    eprintln!("[prove-evm] Recursive proof verified: {}", valid);
     eprintln!(
         "[prove-evm] Steps: {}, Domain: {}",
         recursive_proof.current_proof.num_steps, recursive_proof.current_proof.domain_size

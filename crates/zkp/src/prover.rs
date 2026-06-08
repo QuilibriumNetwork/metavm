@@ -61,6 +61,19 @@ pub struct ExecutionProof {
     pub logup_opening_proof: Option<BatchProof>,
     /// Batch opening proof for LogUp shifted columns at ω·z.
     pub logup_shifted_opening_proof: Option<BatchProof>,
+    // ── Bitwise LogUp (nibble-AND table) proof ─────────────────────────
+    /// Commitments to bitwise LogUp auxiliary columns
+    /// (nibble triples + inverses + table components + u_t + h + m).
+    /// Empty if no bitwise lookup declarations.
+    pub bitwise_commitments: Vec<Commitment>,
+    /// Evaluations of bitwise LogUp columns at z.
+    pub bitwise_evaluations: Vec<Vec<u8>>,
+    /// Evaluation of the bitwise h column at ω·z.
+    pub bitwise_shifted_evaluations: Vec<Vec<u8>>,
+    /// Batch opening proof for bitwise LogUp columns at z.
+    pub bitwise_opening_proof: Option<BatchProof>,
+    /// Batch opening proof for bitwise shifted h at ω·z.
+    pub bitwise_shifted_opening_proof: Option<BatchProof>,
     // ── Memory permutation proof ───────────────────────────────────────
     /// Commitments to permutation auxiliary columns (sorted, Z, is_same_addr, inv_addr_diff).
     /// Empty if no memory permutation.
@@ -93,6 +106,352 @@ pub struct ExecutionProof {
     pub reg_perm_opening_proof: Option<BatchProof>,
     /// Batch opening proof for register permutation shifted columns at ω·z.
     pub reg_perm_shifted_opening_proof: Option<BatchProof>,
+    // ── Frame-stack LIFO permutation proof ────────────────────────────
+    /// Commitment to the Z accumulator column for the frame-stack
+    /// multiset permutation argument. Empty when the AIR does not
+    /// declare a `frame_perm_layout` (RISC-V, SBF).
+    pub frame_perm_commitment: Option<Commitment>,
+    /// Evaluation of Z at z.
+    pub frame_perm_evaluation: Option<Vec<u8>>,
+    /// Evaluation of Z at ω·z (shifted).
+    pub frame_perm_shifted_evaluation: Option<Vec<u8>>,
+    /// Opening proof for Z at z.
+    pub frame_perm_opening_proof: Option<BatchProof>,
+    /// Opening proof for Z at ω·z.
+    pub frame_perm_shifted_opening_proof: Option<BatchProof>,
+    /// Reserved: empty in the current frame-perm design (which evaluates
+    /// `is_pop(z)` rather than `is_pop(ω·z)`). Kept in the wire format
+    /// so the byte layout stays stable if a future variant needs them.
+    pub frame_perm_pop_shifted_evaluations: Vec<Vec<u8>>,
+    /// Reserved; see [`Self::frame_perm_pop_shifted_evaluations`].
+    pub frame_perm_pop_shifted_opening_proof: Option<BatchProof>,
+}
+
+/// Errors from [`ExecutionProof::from_bytes`] decoding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProofDecodeError {
+    /// Buffer truncated mid-field.
+    Truncated { wanted: usize, available: usize },
+    /// Length prefix declares more bytes than remain in the buffer.
+    LengthOverflow,
+    /// Trailing bytes after the proof structure was fully decoded.
+    TrailingBytes(usize),
+    /// `num_quotient_chunks` byte was zero. Any non-zero value is accepted
+    /// — the advanced prover path (logup + permutation arguments) can
+    /// emit 3+ chunks for high-degree grand-product polynomials.
+    InvalidQuotientChunks(u8),
+    /// `Option<BatchProof>` tag byte was neither 0 nor 1.
+    InvalidOptionTag(u8),
+}
+
+impl ExecutionProof {
+    /// Serialize the proof into a self-delimited byte sequence using a
+    /// length-prefixed framing. No external serde dependency — every field
+    /// is already a byte vector (commitments are 74-byte compressed G1
+    /// points wrapped in `Vec<u8>`; evaluations and BatchProofs are
+    /// likewise byte payloads).
+    ///
+    /// Framing primitives (all big-endian):
+    ///   * `bytes(v)`         → `[u32 len][len bytes]`
+    ///   * `vec_bytes(vs)`    → `[u32 count][bytes(vs[0])][bytes(vs[1])]…`
+    ///   * `vec_commit(cs)`   → `vec_bytes` over each commitment's inner bytes
+    ///   * `option(opt)`      → `[u8 tag][BatchProof if tag==1]`
+    ///   * `BatchProof(bp)`   → `bytes(bp.d) ‖ bytes(bp.proof)`
+    ///   * scalar `u64`       → 8 BE bytes
+    ///   * scalar `u8`        → 1 byte
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(1024);
+        write_vec_commit(&mut out, &self.column_commitments);
+        write_vec_commit(&mut out, &self.quotient_commitments);
+        write_vec_bytes(&mut out, &self.evaluations);
+        write_batch_proof(&mut out, &self.opening_proof);
+        out.extend_from_slice(&self.num_steps.to_be_bytes());
+        out.extend_from_slice(&self.domain_size.to_be_bytes());
+        out.push(self.num_quotient_chunks);
+        write_vec_bytes(&mut out, &self.shifted_evaluations);
+        write_option_batch_proof(&mut out, self.shifted_opening_proof.as_ref());
+        write_vec_commit(&mut out, &self.logup_commitments);
+        write_vec_bytes(&mut out, &self.logup_evaluations);
+        write_vec_bytes(&mut out, &self.logup_shifted_evaluations);
+        write_option_batch_proof(&mut out, self.logup_opening_proof.as_ref());
+        write_option_batch_proof(&mut out, self.logup_shifted_opening_proof.as_ref());
+        write_vec_commit(&mut out, &self.bitwise_commitments);
+        write_vec_bytes(&mut out, &self.bitwise_evaluations);
+        write_vec_bytes(&mut out, &self.bitwise_shifted_evaluations);
+        write_option_batch_proof(&mut out, self.bitwise_opening_proof.as_ref());
+        write_option_batch_proof(&mut out, self.bitwise_shifted_opening_proof.as_ref());
+        write_vec_commit(&mut out, &self.perm_commitments);
+        write_vec_bytes(&mut out, &self.perm_evaluations);
+        write_vec_bytes(&mut out, &self.perm_shifted_evaluations);
+        write_option_batch_proof(&mut out, self.perm_opening_proof.as_ref());
+        write_option_batch_proof(&mut out, self.perm_shifted_opening_proof.as_ref());
+        write_vec_bytes(&mut out, &self.oracle_data);
+        write_vec_commit(&mut out, &self.reg_perm_commitments);
+        write_vec_bytes(&mut out, &self.reg_perm_evaluations);
+        write_vec_bytes(&mut out, &self.reg_perm_shifted_evaluations);
+        write_option_batch_proof(&mut out, self.reg_perm_opening_proof.as_ref());
+        write_option_batch_proof(&mut out, self.reg_perm_shifted_opening_proof.as_ref());
+        // Frame-stack permutation fields.
+        write_option_commit(&mut out, self.frame_perm_commitment.as_ref());
+        write_option_bytes(&mut out, self.frame_perm_evaluation.as_deref());
+        write_option_bytes(&mut out, self.frame_perm_shifted_evaluation.as_deref());
+        write_option_batch_proof(&mut out, self.frame_perm_opening_proof.as_ref());
+        write_option_batch_proof(&mut out, self.frame_perm_shifted_opening_proof.as_ref());
+        write_vec_bytes(&mut out, &self.frame_perm_pop_shifted_evaluations);
+        write_option_batch_proof(&mut out, self.frame_perm_pop_shifted_opening_proof.as_ref());
+        out
+    }
+
+    /// Deserialize a proof produced by [`Self::to_bytes`]. Returns
+    /// [`ProofDecodeError`] on malformed input. Strict: trailing bytes
+    /// after a complete decode are an error.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ProofDecodeError> {
+        let mut r = Reader::new(bytes);
+        let column_commitments = r.read_vec_commit()?;
+        let quotient_commitments = r.read_vec_commit()?;
+        let evaluations = r.read_vec_bytes()?;
+        let opening_proof = r.read_batch_proof()?;
+        let num_steps = r.read_u64()?;
+        let domain_size = r.read_u64()?;
+        let num_quotient_chunks = r.read_u8()?;
+        if num_quotient_chunks == 0 {
+            return Err(ProofDecodeError::InvalidQuotientChunks(0));
+        }
+        let shifted_evaluations = r.read_vec_bytes()?;
+        let shifted_opening_proof = r.read_option_batch_proof()?;
+        let logup_commitments = r.read_vec_commit()?;
+        let logup_evaluations = r.read_vec_bytes()?;
+        let logup_shifted_evaluations = r.read_vec_bytes()?;
+        let logup_opening_proof = r.read_option_batch_proof()?;
+        let logup_shifted_opening_proof = r.read_option_batch_proof()?;
+        let bitwise_commitments = r.read_vec_commit()?;
+        let bitwise_evaluations = r.read_vec_bytes()?;
+        let bitwise_shifted_evaluations = r.read_vec_bytes()?;
+        let bitwise_opening_proof = r.read_option_batch_proof()?;
+        let bitwise_shifted_opening_proof = r.read_option_batch_proof()?;
+        let perm_commitments = r.read_vec_commit()?;
+        let perm_evaluations = r.read_vec_bytes()?;
+        let perm_shifted_evaluations = r.read_vec_bytes()?;
+        let perm_opening_proof = r.read_option_batch_proof()?;
+        let perm_shifted_opening_proof = r.read_option_batch_proof()?;
+        let oracle_data = r.read_vec_bytes()?;
+        let reg_perm_commitments = r.read_vec_commit()?;
+        let reg_perm_evaluations = r.read_vec_bytes()?;
+        let reg_perm_shifted_evaluations = r.read_vec_bytes()?;
+        let reg_perm_opening_proof = r.read_option_batch_proof()?;
+        let reg_perm_shifted_opening_proof = r.read_option_batch_proof()?;
+        // Frame-stack permutation fields.
+        let frame_perm_commitment = r.read_option_commit()?;
+        let frame_perm_evaluation = r.read_option_bytes()?;
+        let frame_perm_shifted_evaluation = r.read_option_bytes()?;
+        let frame_perm_opening_proof = r.read_option_batch_proof()?;
+        let frame_perm_shifted_opening_proof = r.read_option_batch_proof()?;
+        let frame_perm_pop_shifted_evaluations = r.read_vec_bytes()?;
+        let frame_perm_pop_shifted_opening_proof = r.read_option_batch_proof()?;
+
+        let trailing = r.remaining();
+        if trailing > 0 {
+            return Err(ProofDecodeError::TrailingBytes(trailing));
+        }
+
+        Ok(ExecutionProof {
+            column_commitments,
+            quotient_commitments,
+            evaluations,
+            opening_proof,
+            num_steps,
+            domain_size,
+            num_quotient_chunks,
+            shifted_evaluations,
+            shifted_opening_proof,
+            logup_commitments,
+            logup_evaluations,
+            logup_shifted_evaluations,
+            logup_opening_proof,
+            logup_shifted_opening_proof,
+            bitwise_commitments,
+            bitwise_evaluations,
+            bitwise_shifted_evaluations,
+            bitwise_opening_proof,
+            bitwise_shifted_opening_proof,
+            perm_commitments,
+            perm_evaluations,
+            perm_shifted_evaluations,
+            perm_opening_proof,
+            perm_shifted_opening_proof,
+            oracle_data,
+            reg_perm_commitments,
+            reg_perm_evaluations,
+            reg_perm_shifted_evaluations,
+            reg_perm_opening_proof,
+            reg_perm_shifted_opening_proof,
+            frame_perm_commitment,
+            frame_perm_evaluation,
+            frame_perm_shifted_evaluation,
+            frame_perm_opening_proof,
+            frame_perm_shifted_opening_proof,
+            frame_perm_pop_shifted_evaluations,
+            frame_perm_pop_shifted_opening_proof,
+        })
+    }
+}
+
+// ── Framing helpers (private) ─────────────────────────────────────────
+
+fn write_bytes(out: &mut Vec<u8>, b: &[u8]) {
+    out.extend_from_slice(&(b.len() as u32).to_be_bytes());
+    out.extend_from_slice(b);
+}
+
+fn write_vec_bytes(out: &mut Vec<u8>, vs: &[Vec<u8>]) {
+    out.extend_from_slice(&(vs.len() as u32).to_be_bytes());
+    for v in vs {
+        write_bytes(out, v);
+    }
+}
+
+fn write_vec_commit(out: &mut Vec<u8>, cs: &[Commitment]) {
+    out.extend_from_slice(&(cs.len() as u32).to_be_bytes());
+    for c in cs {
+        write_bytes(out, &c.0);
+    }
+}
+
+fn write_batch_proof(out: &mut Vec<u8>, bp: &BatchProof) {
+    write_bytes(out, &bp.d);
+    write_bytes(out, &bp.proof);
+}
+
+fn write_option_batch_proof(out: &mut Vec<u8>, opt: Option<&BatchProof>) {
+    match opt {
+        None => out.push(0),
+        Some(bp) => {
+            out.push(1);
+            write_batch_proof(out, bp);
+        }
+    }
+}
+
+fn write_option_commit(out: &mut Vec<u8>, opt: Option<&Commitment>) {
+    match opt {
+        None => out.push(0),
+        Some(c) => {
+            out.push(1);
+            write_bytes(out, &c.0);
+        }
+    }
+}
+
+fn write_option_bytes(out: &mut Vec<u8>, opt: Option<&[u8]>) {
+    match opt {
+        None => out.push(0),
+        Some(b) => {
+            out.push(1);
+            write_bytes(out, b);
+        }
+    }
+}
+
+struct Reader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+
+    fn remaining(&self) -> usize {
+        self.buf.len().saturating_sub(self.pos)
+    }
+
+    fn take(&mut self, n: usize) -> Result<&'a [u8], ProofDecodeError> {
+        if self.pos + n > self.buf.len() {
+            return Err(ProofDecodeError::Truncated {
+                wanted: n,
+                available: self.buf.len() - self.pos,
+            });
+        }
+        let s = &self.buf[self.pos..self.pos + n];
+        self.pos += n;
+        Ok(s)
+    }
+
+    fn read_u8(&mut self) -> Result<u8, ProofDecodeError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn read_u32(&mut self) -> Result<u32, ProofDecodeError> {
+        let s = self.take(4)?;
+        Ok(u32::from_be_bytes([s[0], s[1], s[2], s[3]]))
+    }
+
+    fn read_u64(&mut self) -> Result<u64, ProofDecodeError> {
+        let s = self.take(8)?;
+        let mut a = [0u8; 8];
+        a.copy_from_slice(s);
+        Ok(u64::from_be_bytes(a))
+    }
+
+    fn read_bytes(&mut self) -> Result<Vec<u8>, ProofDecodeError> {
+        let len = self.read_u32()? as usize;
+        if self.pos + len > self.buf.len() {
+            return Err(ProofDecodeError::LengthOverflow);
+        }
+        Ok(self.take(len)?.to_vec())
+    }
+
+    fn read_vec_bytes(&mut self) -> Result<Vec<Vec<u8>>, ProofDecodeError> {
+        let n = self.read_u32()? as usize;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            out.push(self.read_bytes()?);
+        }
+        Ok(out)
+    }
+
+    fn read_vec_commit(&mut self) -> Result<Vec<Commitment>, ProofDecodeError> {
+        let n = self.read_u32()? as usize;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            out.push(Commitment(self.read_bytes()?));
+        }
+        Ok(out)
+    }
+
+    fn read_batch_proof(&mut self) -> Result<BatchProof, ProofDecodeError> {
+        let d = self.read_bytes()?;
+        let proof = self.read_bytes()?;
+        Ok(BatchProof { d, proof })
+    }
+
+    fn read_option_batch_proof(&mut self) -> Result<Option<BatchProof>, ProofDecodeError> {
+        let tag = self.read_u8()?;
+        match tag {
+            0 => Ok(None),
+            1 => Ok(Some(self.read_batch_proof()?)),
+            other => Err(ProofDecodeError::InvalidOptionTag(other)),
+        }
+    }
+
+    fn read_option_commit(&mut self) -> Result<Option<Commitment>, ProofDecodeError> {
+        let tag = self.read_u8()?;
+        match tag {
+            0 => Ok(None),
+            1 => Ok(Some(Commitment(self.read_bytes()?))),
+            other => Err(ProofDecodeError::InvalidOptionTag(other)),
+        }
+    }
+
+    fn read_option_bytes(&mut self) -> Result<Option<Vec<u8>>, ProofDecodeError> {
+        let tag = self.read_u8()?;
+        match tag {
+            0 => Ok(None),
+            1 => Ok(Some(self.read_bytes()?)),
+            other => Err(ProofDecodeError::InvalidOptionTag(other)),
+        }
+    }
 }
 
 /// A chunk proof wrapping an execution proof with state chain metadata.
@@ -106,6 +465,65 @@ pub struct ChunkProof {
     pub final_state_hash: [u8; 32],
     /// Sequential chunk index (0-based).
     pub chunk_index: u64,
+}
+
+impl ChunkProof {
+    /// Serialize the chunk proof: `ExecutionProof bytes ‖ initial_state ‖
+    /// final_state ‖ chunk_index_BE`. Reuses [`ExecutionProof::to_bytes`]
+    /// for the inner proof body, then appends 32 + 32 + 8 = 72 bytes of
+    /// chunk-chain metadata. Total framing makes the byte stream
+    /// self-delimiting.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let inner = self.execution_proof.to_bytes();
+        let mut out = Vec::with_capacity(inner.len() + 4 + 32 + 32 + 8);
+        // Length-prefix the inner ExecutionProof so the decoder knows
+        // where chunk metadata begins.
+        out.extend_from_slice(&(inner.len() as u32).to_be_bytes());
+        out.extend_from_slice(&inner);
+        out.extend_from_slice(&self.initial_state_hash);
+        out.extend_from_slice(&self.final_state_hash);
+        out.extend_from_slice(&self.chunk_index.to_be_bytes());
+        out
+    }
+
+    /// Decode a chunk proof produced by [`Self::to_bytes`]. Strict:
+    /// trailing bytes after a complete decode are an error.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ProofDecodeError> {
+        if bytes.len() < 4 {
+            return Err(ProofDecodeError::Truncated {
+                wanted: 4,
+                available: bytes.len(),
+            });
+        }
+        let inner_len = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+        let inner_end = 4 + inner_len;
+        if bytes.len() < inner_end + 32 + 32 + 8 {
+            return Err(ProofDecodeError::Truncated {
+                wanted: inner_end + 32 + 32 + 8 - 4,
+                available: bytes.len() - 4,
+            });
+        }
+        let execution_proof = ExecutionProof::from_bytes(&bytes[4..inner_end])?;
+        let initial_state_hash: [u8; 32] = bytes[inner_end..inner_end + 32]
+            .try_into()
+            .expect("32 bytes");
+        let final_state_hash: [u8; 32] = bytes[inner_end + 32..inner_end + 64]
+            .try_into()
+            .expect("32 bytes");
+        let chunk_index = u64::from_be_bytes(
+            bytes[inner_end + 64..inner_end + 72].try_into().expect("8 bytes"),
+        );
+        let total = inner_end + 72;
+        if bytes.len() != total {
+            return Err(ProofDecodeError::TrailingBytes(bytes.len() - total));
+        }
+        Ok(ChunkProof {
+            execution_proof,
+            initial_state_hash,
+            final_state_hash,
+            chunk_index,
+        })
+    }
 }
 
 /// Convert 32 Fiat-Shamir challenge bytes to a BLS48-581 BIG field element.
@@ -212,7 +630,15 @@ fn prove_inner(
     // avoiding a redundant IFFT pass over all columns.
     // -----------------------------------------------------------------------
     let c_coeffs: Vec<big::BIG>;
-    let use_build_poly = !constraints.selector_column_indices().is_empty();
+    // Always use the algebraic-coefficient path so that shifted, LogUp,
+    // perm, and reg-perm contributions are part of C(X). The earlier
+    // gating on selector presence left selector-less AIRs (MPT, SSZ)
+    // with a fallback path that omitted those contributions, and the
+    // verifier's mirroring guard skipped the `Q(z)·Z(z) == C(z)` identity
+    // entirely — meaning their constraints were never enforced. Each
+    // selector-less AIR must additionally gate its shifted constraint
+    // to vanish on padding-row transitions so `C / Z_H` is divisible.
+    let use_build_poly = true;
 
     // Compute column coefficients ONCE — reused in Step 8 for evaluations at z
     let column_coeffs_big: Vec<Vec<big::BIG>> = big_columns.iter()
@@ -323,12 +749,14 @@ fn prove_inner(
     // -----------------------------------------------------------------------
     // Step 6: Split Q into chunks if needed, commit each
     // -----------------------------------------------------------------------
-    let num_q_chunks = if quotient_coeffs_all.len() > n {
+    let raw_num_q_chunks = if quotient_coeffs_all.len() > n {
         ((quotient_coeffs_all.len() - 1) / n) + 1
     } else {
         1
     };
-    let num_q_chunks = num_q_chunks.min(2) as u8; // At most 2 chunks for our degree budget
+    eprintln!("[prover-big] c_coeffs.len()={} c_deg={} q_deg={} raw_chunks={}",
+        c_coeffs.len(), c_deg, q_deg, raw_num_q_chunks);
+    let num_q_chunks = raw_num_q_chunks.min(2) as u8; // At most 2 chunks for our degree budget
 
     let mut quotient_commitments = Vec::new();
     let mut q_chunk_coeffs: Vec<Vec<big::BIG>> = Vec::new();
@@ -517,6 +945,11 @@ fn prove_inner(
         logup_shifted_evaluations: Vec::new(),
         logup_opening_proof: None,
         logup_shifted_opening_proof: None,
+        bitwise_commitments: Vec::new(),
+        bitwise_evaluations: Vec::new(),
+        bitwise_shifted_evaluations: Vec::new(),
+        bitwise_opening_proof: None,
+        bitwise_shifted_opening_proof: None,
         perm_commitments: Vec::new(),
         perm_evaluations: Vec::new(),
         perm_shifted_evaluations: Vec::new(),
@@ -528,6 +961,13 @@ fn prove_inner(
         reg_perm_shifted_evaluations: Vec::new(),
         reg_perm_opening_proof: None,
         reg_perm_shifted_opening_proof: None,
+        frame_perm_commitment: None,
+        frame_perm_evaluation: None,
+        frame_perm_shifted_evaluation: None,
+        frame_perm_opening_proof: None,
+        frame_perm_shifted_opening_proof: None,
+        frame_perm_pop_shifted_evaluations: Vec::new(),
+        frame_perm_pop_shifted_opening_proof: None,
     }
 }
 
@@ -550,22 +990,64 @@ pub fn prove_with_scheme(
 }
 
 /// Core proving logic using a generic CommitmentScheme.
-fn prove_inner_scheme(
+/// Output of [`commit_main_columns_phase1`]: everything the rest of the
+/// prover needs to continue past Step 2 (column commitments absorbed into
+/// the Fiat-Shamir transcript). Designed to be opaque from the joint
+/// prover's perspective — it threads the state from phase-1 back into
+/// phase-2 (the as-yet-unexposed remainder of `prove_inner_scheme`).
+pub struct MainCommitState {
+    pub num_steps: u64,
+    pub domain_size: u64,
+    pub col_eval_forms: Vec<Vec<Scalar>>,
+    pub column_coeffs_all: Vec<Vec<Scalar>>,
+    pub column_commitments: Vec<Commitment>,
+    /// Accumulated wall-clock for the IFFT step. Carried so phase-2 can
+    /// keep producing the existing `[prover] ifft_trace=... commit_trace=...`
+    /// diagnostic line without re-instrumenting.
+    pub ifft_trace_ms: u128,
+    pub commit_trace_ms: u128,
+    pub prove_start: std::time::Instant,
+}
+
+/// Phase-1 of the prover: pad the trace, IFFT to coefficient form,
+/// commit to each main trace column, and absorb commitments into the
+/// supplied transcript.
+///
+/// After this call, `transcript` carries `num_steps + domain_size + every
+/// column commitment`. The next protocol step (drawing α) is intentionally
+/// NOT done here so that the **joint cross-AIR prover** can interleave a
+/// joint-γ derivation between multiple AIRs' commit phases.
+pub(crate) fn commit_main_columns_phase1(
     trace: &TracePolynomials,
     constraints: &dyn VmConstraintSystem,
     transcript: &mut Transcript,
     scheme: &dyn crate::scheme::CommitmentScheme,
-) -> ExecutionProof {
+) -> MainCommitState {
     use std::time::Instant;
     let prove_start = Instant::now();
 
     let num_steps = trace.num_steps();
-    let domain_size = trace.domain_size();
+    let raw_domain_size = trace.domain_size();
     let curve = trace.curve;
 
-    // Build evaluation-form column data from trace polynomials
+    // The 8-bit LogUp range table requires ≥ 256 domain slots. When LogUp
+    // declarations are present, bump `domain_size` to `max(raw, 256)` and
+    // re-pad all trace columns with zeros to the enlarged domain.
+    let needs_logup_domain = !constraints.lookup_declarations().is_empty();
+    let domain_size = if needs_logup_domain {
+        raw_domain_size.max(crate::lookup::RANGE_TABLE_SIZE as u64)
+    } else {
+        raw_domain_size
+    };
+
     let mut col_eval_forms: Vec<Vec<Scalar>> = trace.columns.iter()
-        .map(|p| p.evaluations.clone())
+        .map(|p| {
+            let mut v = p.evaluations.clone();
+            if (v.len() as u64) < domain_size {
+                v.resize(domain_size as usize, Scalar::zero(curve));
+            }
+            v
+        })
         .collect();
 
     // Fix selector padding: set the designated "no-op" selector to 1 on
@@ -595,24 +1077,68 @@ fn prove_inner_scheme(
         .collect();
     let ifft_trace_ms = t_ifft.elapsed().as_millis();
 
-    // -----------------------------------------------------------------------
-    // Step 1: Commit to each trace column (coefficient form)
-    // -----------------------------------------------------------------------
+    // Step 1: Commit to each trace column (coefficient form).
     let t_commit_trace = Instant::now();
     let column_commitments: Vec<Commitment> = column_coeffs_all.par_iter()
         .map(|coeffs| Commitment(scheme.commit_coefficients(coeffs)))
         .collect();
     let commit_trace_ms = t_commit_trace.elapsed().as_millis();
 
-    // -----------------------------------------------------------------------
-    // Step 2: Absorb commitments into Fiat-Shamir transcript
-    // -----------------------------------------------------------------------
+    // Step 2: Absorb commitments into Fiat-Shamir transcript.
     transcript.append_u64(b"num_steps", num_steps);
     transcript.append_u64(b"domain_size", domain_size);
-
     for comm in &column_commitments {
         transcript.append_message(b"column_commitment", &comm.0);
     }
+
+    MainCommitState {
+        num_steps,
+        domain_size,
+        col_eval_forms,
+        column_coeffs_all,
+        column_commitments,
+        ifft_trace_ms,
+        commit_trace_ms,
+        prove_start,
+    }
+}
+
+fn prove_inner_scheme(
+    trace: &TracePolynomials,
+    constraints: &dyn VmConstraintSystem,
+    transcript: &mut Transcript,
+    scheme: &dyn crate::scheme::CommitmentScheme,
+) -> ExecutionProof {
+    let phase1 = commit_main_columns_phase1(trace, constraints, transcript, scheme);
+    prove_phase2_from_main_commit(trace, constraints, transcript, scheme, phase1)
+}
+
+/// Phase-2 of the prover: takes the post-commit state from
+/// [`commit_main_columns_phase1`] and a transcript that has already had any
+/// joint cross-AIR challenges absorbed, and produces the final
+/// [`ExecutionProof`] (α derivation through batch openings).
+///
+/// The split lets the joint cross-AIR LogUp prover interleave its γ
+/// derivation between phase-1 and phase-2: each AIR's main commitments are
+/// gathered first, a shared γ is derived from the union, that γ is absorbed
+/// into each AIR's transcript, and only then is each AIR's phase-2 run.
+pub(crate) fn prove_phase2_from_main_commit(
+    trace: &TracePolynomials,
+    constraints: &dyn VmConstraintSystem,
+    transcript: &mut Transcript,
+    scheme: &dyn crate::scheme::CommitmentScheme,
+    phase1: MainCommitState,
+) -> ExecutionProof {
+    use std::time::Instant;
+    let curve = trace.curve;
+    let prove_start = phase1.prove_start;
+    let num_steps = phase1.num_steps;
+    let domain_size = phase1.domain_size;
+    let col_eval_forms = phase1.col_eval_forms;
+    let column_coeffs_all = phase1.column_coeffs_all;
+    let column_commitments = phase1.column_commitments;
+    let ifft_trace_ms = phase1.ifft_trace_ms;
+    let commit_trace_ms = phase1.commit_trace_ms;
 
     // -----------------------------------------------------------------------
     // Step 3: Draw constraint combination challenge alpha
@@ -621,38 +1147,54 @@ fn prove_inner_scheme(
     let alpha = Scalar::from_challenge_bytes(&alpha_bytes, curve);
 
     // -----------------------------------------------------------------------
-    // Step 3b: LogUp range check witness computation
+    // Step 3b: LogUp range check witness computation (extended Phase-0 layout).
+    //
+    // Commits the full `limbs | f | t | u_t | h | m` layout. The downstream
+    // constraint stage (below) adds per-limb inverse, table inverse, and
+    // running-sum transition constraints so the LogUp argument is sound.
+    //
+    // Domain requirement: the 8-bit range table needs `domain_size >= 256`.
+    // Enforced by bumping `domain_size` above when `has_logup` is set.
     // -----------------------------------------------------------------------
     let lookup_reqs = constraints.lookup_declarations();
     let logup_groups = crate::lookup::group_declarations(&lookup_reqs);
-    let logup_layout = crate::lookup::logup_column_layout(&logup_groups);
+    let ext_logup_layout = crate::lookup::extended_logup_column_layout(&logup_groups);
     let has_logup = !logup_groups.is_empty();
 
     let mut logup_commitments: Vec<Commitment> = Vec::new();
     let mut logup_column_coeffs: Vec<Vec<Scalar>> = Vec::new();
+    let mut logup_gamma_opt: Option<Scalar> = None;
     let t_logup = Instant::now();
 
     if has_logup {
-        // Draw gamma challenge for LogUp
         let gamma_bytes = transcript.challenge_bytes(b"logup_gamma");
         let gamma = Scalar::from_challenge_bytes(&gamma_bytes, curve);
+        logup_gamma_opt = Some(gamma.clone());
 
-        // Compute LogUp witness (byte limb decompositions, running sum, multiplicities)
         let col_refs: Vec<&Vec<Scalar>> = col_eval_forms.iter().collect();
-        let witness = crate::lookup::compute_logup_witness(
-            &col_refs, &logup_groups, &logup_layout,
+        let witness = crate::lookup::compute_extended_logup_witness(
+            &col_refs, &logup_groups,
             &gamma, trace.num_rows, domain_size as usize, curve,
         );
 
-        // Flatten limb columns + h + m into auxiliary columns
+        // Emit in the order fixed by `extended_logup_column_layout`:
+        // limbs[..] | f[..] | t | u_t | h | m
         let mut logup_eval_forms: Vec<Vec<Scalar>> = Vec::new();
         for group_limbs in &witness.limb_columns {
             for limb_col in group_limbs {
                 logup_eval_forms.push(limb_col.clone());
             }
         }
+        for group_fs in &witness.f_columns {
+            for f_col in group_fs {
+                logup_eval_forms.push(f_col.clone());
+            }
+        }
+        logup_eval_forms.push(witness.t_column.clone());
+        logup_eval_forms.push(witness.u_t_column.clone());
         logup_eval_forms.push(witness.h_column.clone());
         logup_eval_forms.push(witness.m_column.clone());
+        debug_assert_eq!(logup_eval_forms.len(), ext_logup_layout.num_columns);
 
         // Convert to coefficient form and commit (parallel)
         let (comms, coeffs_list): (Vec<_>, Vec<_>) = logup_eval_forms.par_iter()
@@ -671,6 +1213,77 @@ fn prove_inner_scheme(
         }
     }
     let logup_ms = t_logup.elapsed().as_millis();
+
+    // -----------------------------------------------------------------------
+    // Step 3b': Bitwise LogUp witness computation (nibble-AND table).
+    //
+    // Commits the extended `[per group: a_nibs | b_nibs | and_nibs | f_nibs]
+    // | t_a | t_b | t_c | u_t | h | m` layout. Each per-nibble query
+    // `q_k = a_k + δ·b_k + δ²·c_k` is inverted against γ; the 256-row
+    // preprocessed nibble-AND table gets the same treatment with
+    // `t_a(z)`/`t_b(z)`/`t_c(z)` bound to their canonical Lagrange forms
+    // in the verifier.
+    // -----------------------------------------------------------------------
+    let bitwise_decls_vec = constraints.bitwise_lookup_declarations();
+    let bitwise_groups = crate::lookup::group_bitwise_declarations(&bitwise_decls_vec);
+    let ext_bitwise_layout =
+        crate::lookup::extended_bitwise_column_layout(&bitwise_groups);
+    let has_bitwise = !bitwise_groups.is_empty();
+
+    let mut bitwise_commitments: Vec<Commitment> = Vec::new();
+    let mut bitwise_column_coeffs: Vec<Vec<Scalar>> = Vec::new();
+    let mut bitwise_gamma_opt: Option<Scalar> = None;
+    let mut bitwise_delta_opt: Option<Scalar> = None;
+
+    if has_bitwise {
+        let bw_gamma_bytes = transcript.challenge_bytes(b"bitwise_gamma");
+        let bw_gamma = Scalar::from_challenge_bytes(&bw_gamma_bytes, curve);
+        let bw_delta_bytes = transcript.challenge_bytes(b"bitwise_delta");
+        let bw_delta = Scalar::from_challenge_bytes(&bw_delta_bytes, curve);
+        bitwise_gamma_opt = Some(bw_gamma.clone());
+        bitwise_delta_opt = Some(bw_delta.clone());
+
+        let col_refs: Vec<&Vec<Scalar>> = col_eval_forms.iter().collect();
+        let bw_witness = crate::lookup::compute_extended_bitwise_witness(
+            &col_refs, &bitwise_groups,
+            &bw_gamma, &bw_delta, domain_size as usize, curve,
+        );
+
+        // Emit in the order fixed by `extended_bitwise_column_layout`:
+        // [per group: a_nibs | b_nibs | and_nibs | f_nibs] | t_a | t_b | t_c | u_t | h | m
+        let mut bitwise_eval_forms: Vec<Vec<Scalar>> = Vec::new();
+        for (g_idx, group) in bitwise_groups.iter().enumerate() {
+            let n = group.num_nibbles;
+            for k in 0..n { bitwise_eval_forms.push(bw_witness.nibble_columns[g_idx][k].clone()); }
+            for k in 0..n { bitwise_eval_forms.push(bw_witness.nibble_columns[g_idx][n + k].clone()); }
+            for k in 0..n { bitwise_eval_forms.push(bw_witness.nibble_columns[g_idx][2 * n + k].clone()); }
+            for k in 0..n { bitwise_eval_forms.push(bw_witness.f_columns[g_idx][k].clone()); }
+        }
+        bitwise_eval_forms.push(bw_witness.t_a_column.clone());
+        bitwise_eval_forms.push(bw_witness.t_b_column.clone());
+        bitwise_eval_forms.push(bw_witness.t_c_column.clone());
+        bitwise_eval_forms.push(bw_witness.u_t_column.clone());
+        bitwise_eval_forms.push(bw_witness.h_column.clone());
+        bitwise_eval_forms.push(bw_witness.m_column.clone());
+        debug_assert_eq!(
+            bitwise_eval_forms.len(),
+            ext_bitwise_layout.num_columns
+        );
+
+        let (comms, coeffs_list): (Vec<_>, Vec<_>) = bitwise_eval_forms.par_iter()
+            .map(|col| {
+                let coeffs = scheme.ifft(col, domain_size);
+                let comm = Commitment(scheme.commit_coefficients(&coeffs));
+                (comm, coeffs)
+            })
+            .unzip();
+        bitwise_commitments = comms;
+        bitwise_column_coeffs = coeffs_list;
+
+        for comm in &bitwise_commitments {
+            transcript.append_message(b"bitwise_column_commitment", &comm.0);
+        }
+    }
 
     // -----------------------------------------------------------------------
     // Step 3c: Memory permutation witness computation
@@ -708,9 +1321,18 @@ fn prove_inner_scheme(
                 let rw = if is_store { 1u64 } else { 0u64 };
                 (addr, values, rw)
             } else {
-                // Non-memory row: dummy entry
+                // Non-memory row: dummy entry at a sentinel address that
+                // can't collide with real EVM memory accesses. Using
+                // u64::MAX ensures all dummies cluster together in the
+                // sorted order, separate from any real memory address.
+                // Without this, MSTORE/MSTORE8 writes to addr 0 would
+                // be followed (in sorted order) by dummy "reads" at
+                // addr 0 with value 0, breaking read-consistency. The
+                // verifier matches this convention via the effective_addr
+                // formula in evaluate_grand_product_at_point. Fix landed
+                // 2026-05-12 (see mstore8_memory_perm_fix.md).
                 let values: Vec<u64> = vec![0u64; val_cols.len()];
-                (0u64, values, 0u64)
+                (u64::MAX, values, 0u64)
             };
 
             accesses.push(crate::permutation::MemoryAccess {
@@ -1001,17 +1623,94 @@ fn prove_inner_scheme(
     let reg_perm_ms = t_reg_perm.elapsed().as_millis();
 
     // -----------------------------------------------------------------------
+    // Step 3f: Frame-stack LIFO permutation witness computation.
+    //
+    // For VMs with a nested-call frame stack (EVM), commit a single Z
+    // accumulator column whose grand-product closure proves that the
+    // multiset of pushed parent-frame tuples equals the multiset of
+    // popped parent-frame tuples. See `permutation::FrameStackPermLayout`.
+    // -----------------------------------------------------------------------
+    let frame_perm_layout_opt = constraints.frame_perm_layout();
+    let has_frame_perm = frame_perm_layout_opt.is_some();
+    let mut frame_perm_z_coeffs: Vec<Scalar> = Vec::new();
+    let mut frame_perm_commitment_opt: Option<Commitment> = None;
+    let mut frame_perm_gamma_opt: Option<Scalar> = None;
+    let mut frame_perm_delta_opt: Option<Scalar> = None;
+
+    if let Some(ref fp_layout) = frame_perm_layout_opt {
+        let n = domain_size as usize;
+
+        // Draw frame-perm challenges γ, δ.
+        let fpg_bytes = transcript.challenge_bytes(b"frame_perm_gamma");
+        let fp_gamma = Scalar::from_challenge_bytes(&fpg_bytes, curve);
+        let fpd_bytes = transcript.challenge_bytes(b"frame_perm_delta");
+        let fp_delta = Scalar::from_challenge_bytes(&fpd_bytes, curve);
+        frame_perm_gamma_opt = Some(fp_gamma.clone());
+        frame_perm_delta_opt = Some(fp_delta.clone());
+
+        // Pre-compute the per-row tuple values (push side) and the
+        // shifted-tuple values (pop side, i.e. tuple at row+1).
+        let mut tuple_per_row: Vec<Vec<Scalar>> = Vec::with_capacity(n);
+        let mut tuple_shifted_per_row: Vec<Vec<Scalar>> = Vec::with_capacity(n);
+        for row in 0..n {
+            let next = (row + 1) % n;
+            let mut here: Vec<Scalar> = Vec::with_capacity(fp_layout.tuple_columns.len());
+            let mut there: Vec<Scalar> = Vec::with_capacity(fp_layout.tuple_columns.len());
+            for &c in &fp_layout.tuple_columns {
+                here.push(col_eval_forms[c][row].clone());
+                there.push(col_eval_forms[c][next].clone());
+            }
+            tuple_per_row.push(here);
+            tuple_shifted_per_row.push(there);
+        }
+
+        // Per-row is_push and is_pop (sums of selector evaluations,
+        // guaranteed binary by selector sum-to-one on the AIR).
+        let mut is_push_evals = vec![Scalar::zero(curve); n];
+        let mut is_pop_evals = vec![Scalar::zero(curve); n];
+        for row in 0..n {
+            let mut p = Scalar::zero(curve);
+            for &s in &fp_layout.push_selectors {
+                p = p.add(&col_eval_forms[s][row]);
+            }
+            is_push_evals[row] = p;
+            let mut q = Scalar::zero(curve);
+            for &s in &fp_layout.pop_selectors {
+                q = q.add(&col_eval_forms[s][row]);
+            }
+            is_pop_evals[row] = q;
+        }
+
+        // Compute the Z accumulator column (eval form).
+        let z_eval = crate::permutation::compute_frame_perm_z(
+            &tuple_per_row, &tuple_shifted_per_row,
+            &is_push_evals, &is_pop_evals,
+            &fp_gamma, &fp_delta, curve,
+        );
+
+        // IFFT and commit.
+        let z_coeffs = scheme.ifft(&z_eval, domain_size);
+        let z_comm = Commitment(scheme.commit_coefficients(&z_coeffs));
+        frame_perm_z_coeffs = z_coeffs;
+        frame_perm_commitment_opt = Some(z_comm.clone());
+
+        // Absorb commit so subsequent challenges (z, β, ...) bind to it.
+        transcript.append_message(b"frame_perm_column_commitment", &z_comm.0);
+    }
+
+    // -----------------------------------------------------------------------
     // Step 4: Build C(x) — either via build_constraint_polynomial (selector-based)
     //         or via evaluate_on_domain + IFFT (fallback)
     // -----------------------------------------------------------------------
     let t_constraints = Instant::now();
     let c_coeffs: Vec<Scalar>;
-    let use_build_poly = !constraints.selector_column_indices().is_empty();
+    // See the matching note in the older `prove_inner` above.
+    let use_build_poly = true;
 
     // Compute domain generator ω for cross-row constraints (if needed)
     let shifted_indices = constraints.shifted_column_indices();
     let has_shifts = !shifted_indices.is_empty();
-    let omega = if has_shifts || has_logup || has_perm || has_reg_perm {
+    let omega = if has_shifts || has_logup || has_bitwise || has_perm || has_reg_perm || has_frame_perm {
         Some(scheme.domain_generator(domain_size))
     } else {
         None
@@ -1047,7 +1746,7 @@ fn prove_inner_scheme(
 
             let lookup_reqs = constraints.lookup_declarations();
             let logup_groups_for_cx = crate::lookup::group_declarations(&lookup_reqs);
-            let logup_layout_for_cx = crate::lookup::logup_column_layout(&logup_groups_for_cx);
+            let logup_layout_for_cx = crate::lookup::extended_logup_column_layout(&logup_groups_for_cx);
 
             // For each group: build sel(X) * (value(X) - Σ limb_k(X) * 256^k)
             for (g_idx, group) in logup_groups_for_cx.iter().enumerate() {
@@ -1091,9 +1790,12 @@ fn prove_inner_scheme(
 
             alpha_offset += logup_groups_for_cx.len();
 
-            // Running sum boundary: L_0(X) · h(X) = 0 (ensures h(ω^0) = 0)
-            // L_0(X) = (1/n) · (1 + X + X^2 + ... + X^{n-1})
             let h_idx = logup_layout_for_cx.h_column;
+            let m_idx = logup_layout_for_cx.m_column;
+            let t_idx = logup_layout_for_cx.t_column;
+            let u_t_idx = logup_layout_for_cx.u_t_column;
+
+            // Running sum boundary: L_0(X) · h(X) = 0 (ensures h(ω^0) = 0).
             if h_idx < logup_column_coeffs.len() {
                 let n = domain_size as usize;
                 let n_inv = Scalar::from_u64(n as u64, curve).inverse();
@@ -1103,6 +1805,289 @@ fn prove_inner_scheme(
                 let scaled_h_boundary = crate::poly_arith::poly_scalar_mul(&body_h_boundary, &ap);
                 c_intra = crate::poly_arith::poly_add(&c_intra, &scaled_h_boundary, curve);
                 ap = ap.mul(&alpha);
+                alpha_offset += 1;
+            }
+
+            // Phase-0 extended constraints: per-limb inverse, table inverse,
+            // running-sum transition. Constraint count matches
+            // `num_extended_logup_constraints(logup_groups)`.
+            let gamma = logup_gamma_opt.clone()
+                .expect("logup gamma must be set when has_logup");
+            let n = domain_size as usize;
+            let gamma_poly: Vec<Scalar> = {
+                let mut v = vec![Scalar::zero(curve); n];
+                v[0] = gamma.clone();
+                v
+            };
+            let one_poly: Vec<Scalar> = {
+                let mut v = vec![Scalar::zero(curve); n];
+                v[0] = Scalar::one(curve);
+                v
+            };
+
+            // (A) f_k(X) · (γ - ℓ_k(X)) - 1 = 0 for each limb across all groups.
+            for (g_idx, _group) in logup_groups_for_cx.iter().enumerate() {
+                let (limb_start, num_limbs) = logup_layout_for_cx.limb_offsets[g_idx];
+                let (f_start, _) = logup_layout_for_cx.f_offsets[g_idx];
+                for l in 0..num_limbs {
+                    let limb_coeffs = &logup_column_coeffs[limb_start + l];
+                    let f_coeffs = &logup_column_coeffs[f_start + l];
+                    let gamma_minus_l = crate::poly_arith::poly_sub(&gamma_poly, limb_coeffs, curve);
+                    let prod = crate::poly_arith::poly_mul(f_coeffs, &gamma_minus_l, curve);
+                    let body = crate::poly_arith::poly_sub(&prod, &one_poly, curve);
+                    let scaled = crate::poly_arith::poly_scalar_mul(&body, &ap);
+                    c_intra = crate::poly_arith::poly_add(&c_intra, &scaled, curve);
+                    ap = ap.mul(&alpha);
+                    alpha_offset += 1;
+                }
+            }
+
+            // (B) u_t(X) · (γ - t(X)) - 1 = 0
+            if u_t_idx < logup_column_coeffs.len() && t_idx < logup_column_coeffs.len() {
+                let t_coeffs = &logup_column_coeffs[t_idx];
+                let u_t_coeffs = &logup_column_coeffs[u_t_idx];
+                let gamma_minus_t = crate::poly_arith::poly_sub(&gamma_poly, t_coeffs, curve);
+                let prod = crate::poly_arith::poly_mul(u_t_coeffs, &gamma_minus_t, curve);
+                let body = crate::poly_arith::poly_sub(&prod, &one_poly, curve);
+                let scaled = crate::poly_arith::poly_scalar_mul(&body, &ap);
+                c_intra = crate::poly_arith::poly_add(&c_intra, &scaled, curve);
+                ap = ap.mul(&alpha);
+                alpha_offset += 1;
+            }
+
+            // (C) Cyclic running-sum transition:
+            // h(ωX) - h(X) - Σ_{g,k} active_g(X)·f_{g,k}(X) + m(X)·u_t(X) = 0
+            if h_idx < logup_column_coeffs.len() {
+                let om = omega.as_ref().expect("omega required for transition");
+                let h_coeffs = &logup_column_coeffs[h_idx];
+                let m_coeffs = &logup_column_coeffs[m_idx];
+                let u_t_coeffs = &logup_column_coeffs[u_t_idx];
+                let h_shifted = crate::poly_arith::poly_shift(h_coeffs, om);
+                let mut body = crate::poly_arith::poly_sub(&h_shifted, h_coeffs, curve);
+                for (g_idx, group) in logup_groups_for_cx.iter().enumerate() {
+                    let (f_start, num_limbs) = logup_layout_for_cx.f_offsets[g_idx];
+                    let active_coeffs: Vec<Scalar> = if group.selectors.is_empty() {
+                        one_poly.clone()
+                    } else {
+                        let mut s = vec![Scalar::zero(curve); n];
+                        for &sel_idx in &group.selectors {
+                            s = crate::poly_arith::poly_add(&s, &column_coeffs_all[sel_idx], curve);
+                        }
+                        s
+                    };
+                    for l in 0..num_limbs {
+                        let f_coeffs = &logup_column_coeffs[f_start + l];
+                        let term = crate::poly_arith::poly_mul(&active_coeffs, f_coeffs, curve);
+                        body = crate::poly_arith::poly_sub(&body, &term, curve);
+                    }
+                }
+                let mu_term = crate::poly_arith::poly_mul(m_coeffs, u_t_coeffs, curve);
+                body = crate::poly_arith::poly_add(&body, &mu_term, curve);
+                let scaled = crate::poly_arith::poly_scalar_mul(&body, &ap);
+                c_intra = crate::poly_arith::poly_add(&c_intra, &scaled, curve);
+                #[allow(unused_assignments)] {
+                    ap = ap.mul(&alpha);
+                }
+                alpha_offset += 1;
+            }
+        }
+
+        // Add bitwise LogUp constraints to C(x)
+        if has_bitwise {
+            let mut ap = Scalar::one(curve);
+            for _ in 0..alpha_offset {
+                ap = ap.mul(&alpha);
+            }
+
+            let bw_gamma = bitwise_gamma_opt.clone()
+                .expect("bitwise gamma must be set when has_bitwise");
+            let bw_delta = bitwise_delta_opt.clone()
+                .expect("bitwise delta must be set when has_bitwise");
+            let bw_delta_sq = bw_delta.mul(&bw_delta);
+            let n = domain_size as usize;
+            let one_poly: Vec<Scalar> = {
+                let mut v = vec![Scalar::zero(curve); n];
+                v[0] = Scalar::one(curve);
+                v
+            };
+            let bw_gamma_poly: Vec<Scalar> = {
+                let mut v = vec![Scalar::zero(curve); n];
+                v[0] = bw_gamma.clone();
+                v
+            };
+
+            // Pre-compute powers of 16 for nibble recomposition.
+            let sixteen = Scalar::from_u64(16, curve);
+
+            // (BW-A) Per-group nibble decomposition + result derivation
+            for (g_idx, group) in bitwise_groups.iter().enumerate() {
+                let (nib_start, num_nibs) = ext_bitwise_layout.nibble_offsets[g_idx];
+                let a_start = nib_start;
+                let b_start = nib_start + num_nibs;
+                let c_start = nib_start + 2 * num_nibs;
+
+                let combined_sel_coeffs: Vec<Scalar> = if group.selectors.is_empty() {
+                    one_poly.clone()
+                } else {
+                    let mut s = vec![Scalar::zero(curve); n];
+                    for &sel_idx in &group.selectors {
+                        s = crate::poly_arith::poly_add(
+                            &s, &column_coeffs_all[sel_idx], curve,
+                        );
+                    }
+                    s
+                };
+
+                // Recompose a_nibbles → a_recomposed, b_nibbles → b_recomposed,
+                // and_nibbles → c_recomposed (all in coefficient form).
+                let recompose = |start: usize| -> Vec<Scalar> {
+                    let mut acc = vec![Scalar::zero(curve); n];
+                    let mut power = Scalar::one(curve);
+                    for k in 0..num_nibs {
+                        let nib_coeffs = &bitwise_column_coeffs[start + k];
+                        let scaled = crate::poly_arith::poly_scalar_mul(nib_coeffs, &power);
+                        acc = crate::poly_arith::poly_add(&acc, &scaled, curve);
+                        power = power.mul(&sixteen);
+                    }
+                    acc
+                };
+                let a_recomposed = recompose(a_start);
+                let b_recomposed = recompose(b_start);
+                let c_recomposed = recompose(c_start);
+
+                // Constraint: sel · (operand_a - a_recomposed) = 0
+                let a_operand_coeffs = &column_coeffs_all[group.operand_a_column];
+                let a_diff = crate::poly_arith::poly_sub(a_operand_coeffs, &a_recomposed, curve);
+                let a_body = crate::poly_arith::poly_mul(&combined_sel_coeffs, &a_diff, curve);
+                let scaled = crate::poly_arith::poly_scalar_mul(&a_body, &ap);
+                c_intra = crate::poly_arith::poly_add(&c_intra, &scaled, curve);
+                ap = ap.mul(&alpha);
+                alpha_offset += 1;
+
+                // Constraint: sel · (operand_b - b_recomposed) = 0
+                let b_operand_coeffs = &column_coeffs_all[group.operand_b_column];
+                let b_diff = crate::poly_arith::poly_sub(b_operand_coeffs, &b_recomposed, curve);
+                let b_body = crate::poly_arith::poly_mul(&combined_sel_coeffs, &b_diff, curve);
+                let scaled = crate::poly_arith::poly_scalar_mul(&b_body, &ap);
+                c_intra = crate::poly_arith::poly_add(&c_intra, &scaled, curve);
+                ap = ap.mul(&alpha);
+                alpha_offset += 1;
+
+                // Result derivation depending on op
+                // AND: result = c_recomposed
+                // OR:  result = a + b - c_recomposed
+                // XOR: result = a + b - 2·c_recomposed
+                let expected: Vec<Scalar> = match group.op {
+                    crate::lookup::BitwiseOp::And => c_recomposed.clone(),
+                    crate::lookup::BitwiseOp::Or => {
+                        let ab = crate::poly_arith::poly_add(a_operand_coeffs, b_operand_coeffs, curve);
+                        crate::poly_arith::poly_sub(&ab, &c_recomposed, curve)
+                    }
+                    crate::lookup::BitwiseOp::Xor => {
+                        let ab = crate::poly_arith::poly_add(a_operand_coeffs, b_operand_coeffs, curve);
+                        let two_c = crate::poly_arith::poly_scalar_mul(&c_recomposed, &Scalar::from_u64(2, curve));
+                        crate::poly_arith::poly_sub(&ab, &two_c, curve)
+                    }
+                };
+                let result_coeffs = &column_coeffs_all[group.result_column];
+                let r_diff = crate::poly_arith::poly_sub(result_coeffs, &expected, curve);
+                let r_body = crate::poly_arith::poly_mul(&combined_sel_coeffs, &r_diff, curve);
+                let scaled = crate::poly_arith::poly_scalar_mul(&r_body, &ap);
+                c_intra = crate::poly_arith::poly_add(&c_intra, &scaled, curve);
+                ap = ap.mul(&alpha);
+                alpha_offset += 1;
+            }
+
+            // (BW-B) Per-nibble-position inverse constraint:
+            // f_k · (γ - (a_k + δ·b_k + δ²·c_k)) - 1 = 0
+            for (g_idx, group) in bitwise_groups.iter().enumerate() {
+                let (nib_start, num_nibs) = ext_bitwise_layout.nibble_offsets[g_idx];
+                let (f_start, _) = ext_bitwise_layout.f_offsets[g_idx];
+                for k in 0..num_nibs {
+                    let a_coeffs = &bitwise_column_coeffs[nib_start + k];
+                    let b_coeffs = &bitwise_column_coeffs[nib_start + num_nibs + k];
+                    let c_coeffs = &bitwise_column_coeffs[nib_start + 2 * num_nibs + k];
+                    let f_coeffs = &bitwise_column_coeffs[f_start + k];
+                    // q = a + δ·b + δ²·c
+                    let b_scaled = crate::poly_arith::poly_scalar_mul(b_coeffs, &bw_delta);
+                    let c_scaled = crate::poly_arith::poly_scalar_mul(c_coeffs, &bw_delta_sq);
+                    let ab = crate::poly_arith::poly_add(a_coeffs, &b_scaled, curve);
+                    let q = crate::poly_arith::poly_add(&ab, &c_scaled, curve);
+                    let gamma_minus_q = crate::poly_arith::poly_sub(&bw_gamma_poly, &q, curve);
+                    let prod = crate::poly_arith::poly_mul(f_coeffs, &gamma_minus_q, curve);
+                    let body = crate::poly_arith::poly_sub(&prod, &one_poly, curve);
+                    let scaled = crate::poly_arith::poly_scalar_mul(&body, &ap);
+                    c_intra = crate::poly_arith::poly_add(&c_intra, &scaled, curve);
+                    ap = ap.mul(&alpha);
+                    alpha_offset += 1;
+                }
+                let _ = group; // silence unused
+            }
+
+            // (BW-C) Table inverse: u_t · (γ - (t_a + δ·t_b + δ²·t_c)) - 1 = 0
+            let t_a_coeffs = &bitwise_column_coeffs[ext_bitwise_layout.t_a_column];
+            let t_b_coeffs = &bitwise_column_coeffs[ext_bitwise_layout.t_b_column];
+            let t_c_coeffs = &bitwise_column_coeffs[ext_bitwise_layout.t_c_column];
+            let u_t_bw_coeffs = &bitwise_column_coeffs[ext_bitwise_layout.u_t_column];
+            {
+                let t_b_scaled = crate::poly_arith::poly_scalar_mul(t_b_coeffs, &bw_delta);
+                let t_c_scaled = crate::poly_arith::poly_scalar_mul(t_c_coeffs, &bw_delta_sq);
+                let t_ab = crate::poly_arith::poly_add(t_a_coeffs, &t_b_scaled, curve);
+                let t_combined = crate::poly_arith::poly_add(&t_ab, &t_c_scaled, curve);
+                let gamma_minus_t = crate::poly_arith::poly_sub(&bw_gamma_poly, &t_combined, curve);
+                let prod = crate::poly_arith::poly_mul(u_t_bw_coeffs, &gamma_minus_t, curve);
+                let body = crate::poly_arith::poly_sub(&prod, &one_poly, curve);
+                let scaled = crate::poly_arith::poly_scalar_mul(&body, &ap);
+                c_intra = crate::poly_arith::poly_add(&c_intra, &scaled, curve);
+                ap = ap.mul(&alpha);
+                alpha_offset += 1;
+            }
+
+            // (BW-D) Running-sum transition (cyclic):
+            // h(ωX) - h(X) - Σ_{g,k} active_g · f_{g,k} + m · u_t = 0
+            let h_bw_coeffs = &bitwise_column_coeffs[ext_bitwise_layout.h_column];
+            let m_bw_coeffs = &bitwise_column_coeffs[ext_bitwise_layout.m_column];
+            {
+                let om = omega.as_ref().expect("omega required for bitwise transition");
+                let h_shifted = crate::poly_arith::poly_shift(h_bw_coeffs, om);
+                let mut body = crate::poly_arith::poly_sub(&h_shifted, h_bw_coeffs, curve);
+                for (g_idx, group) in bitwise_groups.iter().enumerate() {
+                    let (f_start, num_nibs) = ext_bitwise_layout.f_offsets[g_idx];
+                    let active_coeffs: Vec<Scalar> = if group.selectors.is_empty() {
+                        one_poly.clone()
+                    } else {
+                        let mut s = vec![Scalar::zero(curve); n];
+                        for &sel_idx in &group.selectors {
+                            s = crate::poly_arith::poly_add(
+                                &s, &column_coeffs_all[sel_idx], curve,
+                            );
+                        }
+                        s
+                    };
+                    for k in 0..num_nibs {
+                        let f_coeffs = &bitwise_column_coeffs[f_start + k];
+                        let term = crate::poly_arith::poly_mul(&active_coeffs, f_coeffs, curve);
+                        body = crate::poly_arith::poly_sub(&body, &term, curve);
+                    }
+                }
+                let mu_term = crate::poly_arith::poly_mul(m_bw_coeffs, u_t_bw_coeffs, curve);
+                body = crate::poly_arith::poly_add(&body, &mu_term, curve);
+                let scaled = crate::poly_arith::poly_scalar_mul(&body, &ap);
+                c_intra = crate::poly_arith::poly_add(&c_intra, &scaled, curve);
+                ap = ap.mul(&alpha);
+                alpha_offset += 1;
+            }
+
+            // (BW-E) Boundary: L_0(X) · h(X) = 0
+            {
+                let n_inv = Scalar::from_u64(n as u64, curve).inverse();
+                let l0_coeffs: Vec<Scalar> = vec![n_inv; n];
+                let body = crate::poly_arith::poly_mul(&l0_coeffs, h_bw_coeffs, curve);
+                let scaled = crate::poly_arith::poly_scalar_mul(&body, &ap);
+                c_intra = crate::poly_arith::poly_add(&c_intra, &scaled, curve);
+                #[allow(unused_assignments)] {
+                    ap = ap.mul(&alpha);
+                }
                 alpha_offset += 1;
             }
         }
@@ -1159,11 +2144,15 @@ fn prove_inner_scheme(
                 c_intra = crate::poly_arith::poly_add(&c_intra, &scaled2, curve);
                 ap = ap.mul(&alpha);
 
-                // Constraint 3: (1 - is_same_addr(ω·X)) * (1 - addr_diff * inv_addr_diff) = 0
+                // Constraint 3: (1 - is_same_addr(ω·X)) * (1 - addr_diff · inv_addr_diff(ω·X)) = 0
                 // Multiply by (X - ω^{n-1})
+                // BUG FIX 2026-05-12: use SHIFTED inv_addr_diff so both
+                // flags reference the same (X → ω·X) transition. See
+                // memory/mstore8_memory_perm_fix.md.
                 let one_minus_isa_shifted = crate::poly_arith::poly_sub(&one_poly, &isa_shifted, curve);
                 let inv_diff_coeffs = &perm_column_coeffs[layout.inv_addr_diff];
-                let addr_diff_inv_prod = crate::poly_arith::poly_mul(&addr_diff, inv_diff_coeffs, curve);
+                let inv_diff_shifted = crate::poly_arith::poly_shift(inv_diff_coeffs, om);
+                let addr_diff_inv_prod = crate::poly_arith::poly_mul(&addr_diff, &inv_diff_shifted, curve);
                 let one_minus_prod = crate::poly_arith::poly_sub(&one_poly, &addr_diff_inv_prod, curve);
                 let body3_inner = crate::poly_arith::poly_mul(&one_minus_isa_shifted, &one_minus_prod, curve);
                 let body3 = crate::poly_arith::poly_mul_linear(&body3_inner, &omega_n_minus_1);
@@ -1193,7 +2182,7 @@ fn prove_inner_scheme(
                 // Z(ω·X) · denom(X) - Z(X) · numer(X) = 0
                 // numer(X) = γ + addr(X) + δ·val(X) + δ²·ts(X) + δ³·rw(X)  (original trace)
                 // denom(X) = γ + sorted_addr(X) + δ·sorted_val(X) + δ²·sorted_ts(X) + δ³·sorted_rw(X)
-                if let (Some((addr_col, val_cols, _load_sel, store_sel)), Some(ref pg), Some(ref pd)) =
+                if let (Some((addr_col, val_cols, load_sel, store_sel)), Some(ref pg), Some(ref pd)) =
                     (&mem_cols, &perm_gamma_opt, &perm_delta_opt)
                 {
                     let delta2 = pd.mul(pd);
@@ -1206,7 +2195,34 @@ fn prove_inner_scheme(
                         p
                     };
                     let mut numer_poly = gamma_poly.clone();
-                    numer_poly = crate::poly_arith::poly_add(&numer_poly, &column_coeffs_all[*addr_col], curve);
+                    // effective_addr(X) = real_mem(X) · addr(X) + (1 - real_mem(X)) · SENTINEL
+                    // real_mem(X) = Σ load_sels(X) + Σ store_sels(X) — binary
+                    // (selectors are mutually exclusive). Matches the prover's
+                    // u64::MAX dummy convention and the verifier's at-point
+                    // reconstruction. See mstore8_memory_perm_fix.md.
+                    let mut real_mem_poly: Vec<Scalar> = vec![Scalar::zero(curve)];
+                    for &ls in load_sel {
+                        real_mem_poly = crate::poly_arith::poly_add(&real_mem_poly, &column_coeffs_all[ls], curve);
+                    }
+                    for &ss in store_sel {
+                        real_mem_poly = crate::poly_arith::poly_add(&real_mem_poly, &column_coeffs_all[ss], curve);
+                    }
+                    let sentinel_scalar = Scalar::from_u64(u64::MAX, curve);
+                    let sentinel_poly = {
+                        let mut p = vec![Scalar::zero(curve); domain_size as usize];
+                        p[0] = sentinel_scalar;
+                        p
+                    };
+                    let one_poly_const = {
+                        let mut p = vec![Scalar::zero(curve); domain_size as usize];
+                        p[0] = Scalar::one(curve);
+                        p
+                    };
+                    let one_minus_real_mem = crate::poly_arith::poly_sub(&one_poly_const, &real_mem_poly, curve);
+                    let real_addr_term = crate::poly_arith::poly_mul(&real_mem_poly, &column_coeffs_all[*addr_col], curve);
+                    let sentinel_term = crate::poly_arith::poly_mul(&one_minus_real_mem, &sentinel_poly, curve);
+                    let effective_addr_poly = crate::poly_arith::poly_add(&real_addr_term, &sentinel_term, curve);
+                    numer_poly = crate::poly_arith::poly_add(&numer_poly, &effective_addr_poly, curve);
 
                     // δ · val_combined(X)
                     if val_cols.len() == 1 {
@@ -1290,7 +2306,9 @@ fn prove_inner_scheme(
                     let body_boundary = crate::poly_arith::poly_mul(&l0_coeffs, &z_minus_one, curve);
                     let scaled_boundary = crate::poly_arith::poly_scalar_mul(&body_boundary, &ap);
                     c_intra = crate::poly_arith::poly_add(&c_intra, &scaled_boundary, curve);
-                    ap = ap.mul(&alpha);
+                    #[allow(unused_assignments)] {
+                        ap = ap.mul(&alpha);
+                    }
                 }
 
                 alpha_offset += crate::permutation::num_permutation_constraints(layout);
@@ -1465,6 +2483,57 @@ fn prove_inner_scheme(
             }
         }
 
+        // Frame-stack permutation contribution.
+        if let Some(ref fp_layout) = frame_perm_layout_opt {
+            let fp_gamma = frame_perm_gamma_opt.as_ref().unwrap();
+            let fp_delta = frame_perm_delta_opt.as_ref().unwrap();
+            let om = omega.as_ref().unwrap();
+
+            // Z polynomial in coefficient form (already computed above).
+            let z_coeffs_fp: &[Scalar] = &frame_perm_z_coeffs;
+            let z_shifted_coeffs = crate::poly_arith::poly_shift(z_coeffs_fp, om);
+
+            // Tuple polynomial coefficients: each tuple column is a
+            // trace polynomial; the shifted version is its poly_shift.
+            let tuple_coeffs: Vec<Vec<Scalar>> = fp_layout.tuple_columns.iter()
+                .map(|&c| column_coeffs_all[c].clone())
+                .collect();
+            let tuple_shifted_coeffs: Vec<Vec<Scalar>> = tuple_coeffs.iter()
+                .map(|c| crate::poly_arith::poly_shift(c, om))
+                .collect();
+
+            // is_push(X) = Σ push_sel_k(X); is_pop(X) = Σ pop_sel_k(X).
+            let n = domain_size as usize;
+            let zero_poly: Vec<Scalar> = vec![Scalar::zero(curve); n];
+            let mut is_push_coeffs = zero_poly.clone();
+            for &s in &fp_layout.push_selectors {
+                is_push_coeffs = crate::poly_arith::poly_add(
+                    &is_push_coeffs, &column_coeffs_all[s], curve);
+            }
+            let mut is_pop_coeffs = zero_poly.clone();
+            for &s in &fp_layout.pop_selectors {
+                is_pop_coeffs = crate::poly_arith::poly_add(
+                    &is_pop_coeffs, &column_coeffs_all[s], curve);
+            }
+
+            let body = crate::permutation::build_frame_perm_polynomial(
+                z_coeffs_fp,
+                &z_shifted_coeffs,
+                &tuple_coeffs,
+                &tuple_shifted_coeffs,
+                &is_push_coeffs,
+                &is_pop_coeffs,
+                fp_gamma,
+                fp_delta,
+                domain_size,
+                &alpha,
+                alpha_offset,
+            );
+            c_intra = crate::poly_arith::poly_add(&c_intra, &body, curve);
+            alpha_offset +=
+                crate::permutation::FrameStackPermLayout::NUM_CONSTRAINTS;
+        }
+
         let _ = alpha_offset;
         c_coeffs = c_intra;
     } else {
@@ -1612,6 +2681,22 @@ fn prove_inner_scheme(
     }
 
     // -----------------------------------------------------------------------
+    // Step 8c': Evaluate bitwise LogUp columns at z and bitwise h at ω·z
+    // -----------------------------------------------------------------------
+    let mut bitwise_evaluations_vec: Vec<Vec<u8>> = Vec::new();
+    let mut bitwise_shifted_evaluations: Vec<Vec<u8>> = Vec::new();
+    if has_bitwise {
+        for coeffs in &bitwise_column_coeffs {
+            let y = scheme.eval_poly_at(coeffs, &z);
+            bitwise_evaluations_vec.push(y.to_bytes());
+        }
+        let h_bw_idx = ext_bitwise_layout.h_column;
+        let omega_z = omega.as_ref().unwrap().mul(&z);
+        let h_shifted = scheme.eval_poly_at(&bitwise_column_coeffs[h_bw_idx], &omega_z);
+        bitwise_shifted_evaluations.push(h_shifted.to_bytes());
+    }
+
+    // -----------------------------------------------------------------------
     // Step 8d: Evaluate permutation columns at z and shifted columns at ω·z
     // -----------------------------------------------------------------------
     let mut perm_evaluations_vec: Vec<Vec<u8>> = Vec::new();
@@ -1645,6 +2730,22 @@ fn prove_inner_scheme(
             reg_perm_shifted_evals_vec.push(y.to_bytes());
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Step 8f: Evaluate frame-perm Z column at z and ω·z, and pop
+    // selectors at ω·z (needed by the verifier to reconstruct
+    // pop_factor at z).
+    // -----------------------------------------------------------------------
+    let mut frame_perm_eval_z: Option<Vec<u8>> = None;
+    let mut frame_perm_eval_omega_z: Option<Vec<u8>> = None;
+    let frame_perm_pop_shifted_evals: Vec<Vec<u8>> = Vec::new();
+    if has_frame_perm {
+        let omega_z = omega.as_ref().unwrap().mul(&z);
+        let z_at_z = scheme.eval_poly_at(&frame_perm_z_coeffs, &z);
+        frame_perm_eval_z = Some(z_at_z.to_bytes());
+        let z_at_omega = scheme.eval_poly_at(&frame_perm_z_coeffs, &omega_z);
+        frame_perm_eval_omega_z = Some(z_at_omega.to_bytes());
+    }
     let evals_ms = t_evals.elapsed().as_millis();
 
     // -----------------------------------------------------------------------
@@ -1662,6 +2763,12 @@ fn prove_inner_scheme(
     for lse in &logup_shifted_evaluations {
         transcript.append_message(b"logup_shifted_evaluation", lse);
     }
+    for be in &bitwise_evaluations_vec {
+        transcript.append_message(b"bitwise_evaluation", be);
+    }
+    for bse in &bitwise_shifted_evaluations {
+        transcript.append_message(b"bitwise_shifted_evaluation", bse);
+    }
     for pe in &perm_evaluations_vec {
         transcript.append_message(b"perm_evaluation", pe);
     }
@@ -1674,6 +2781,13 @@ fn prove_inner_scheme(
     for rse in &reg_perm_shifted_evals_vec {
         transcript.append_message(b"reg_perm_shifted_evaluation", rse);
     }
+    if let Some(ref fpe) = frame_perm_eval_z {
+        transcript.append_message(b"frame_perm_evaluation", fpe);
+    }
+    if let Some(ref fpse) = frame_perm_eval_omega_z {
+        transcript.append_message(b"frame_perm_shifted_evaluation", fpse);
+    }
+    let _ = &frame_perm_pop_shifted_evals; // reserved
     let beta_bytes = transcript.challenge_bytes(b"beta");
     let beta = Scalar::from_challenge_bytes(&beta_bytes, curve);
 
@@ -1797,8 +2911,11 @@ fn prove_inner_scheme(
     };
 
     let logup_shifted_opening_proof = if has_logup && !logup_shifted_evaluations.is_empty() {
-        let beta_logup_shifted_bytes = transcript.challenge_bytes(b"beta_logup_shifted");
-        let beta_logup_shifted = Scalar::from_challenge_bytes(&beta_logup_shifted_bytes, curve);
+        // Advance the transcript by drawing β_logup_shifted even though we
+        // never use the value — there is only one logup-shifted column (h)
+        // so β-RLC is unnecessary, but skipping the draw would desync the
+        // verifier's transcript replay.
+        let _ = transcript.challenge_bytes(b"beta_logup_shifted");
         let omega_z = omega.as_ref().unwrap().mul(&z);
         let h_idx = logup_column_coeffs.len() - 2;
 
@@ -1821,6 +2938,57 @@ fn prove_inner_scheme(
             d: vec![],
             proof: proof_point,
         })
+    } else {
+        None
+    };
+
+    // -----------------------------------------------------------------------
+    // Step 10c': Batch open bitwise LogUp columns at z and bitwise h at ω·z
+    // -----------------------------------------------------------------------
+    let bitwise_opening_proof = if has_bitwise && !bitwise_column_coeffs.is_empty() {
+        let beta_bw_bytes = transcript.challenge_bytes(b"beta_bitwise");
+        let beta_bw = Scalar::from_challenge_bytes(&beta_bw_bytes, curve);
+
+        let mut combined = vec![Scalar::zero(curve); n];
+        let mut combined_y = Scalar::zero(curve);
+        let mut bb_power = Scalar::one(curve);
+
+        for (i, coeffs) in bitwise_column_coeffs.iter().enumerate() {
+            let y = Scalar::from_bytes(&bitwise_evaluations_vec[i], curve);
+            combined_y = combined_y.add(&bb_power.mul(&y));
+            for j in 0..coeffs.len().min(n) {
+                combined[j] = combined[j].add(&bb_power.mul(&coeffs[j]));
+            }
+            bb_power = bb_power.mul(&beta_bw);
+        }
+
+        combined[0] = combined[0].sub(&combined_y);
+        let q_bw = scheme.div_by_linear(&combined, &z);
+        let proof_point = scheme.commit_coefficients(&q_bw);
+        Some(BatchProof { d: vec![], proof: proof_point })
+    } else {
+        None
+    };
+
+    let bitwise_shifted_opening_proof = if has_bitwise && !bitwise_shifted_evaluations.is_empty() {
+        let beta_bw_shifted_bytes = transcript.challenge_bytes(b"beta_bitwise_shifted");
+        let beta_bw_shifted = Scalar::from_challenge_bytes(&beta_bw_shifted_bytes, curve);
+        let omega_z = omega.as_ref().unwrap().mul(&z);
+        let h_bw_idx = ext_bitwise_layout.h_column;
+
+        let mut combined = vec![Scalar::zero(curve); n];
+        let bl_power = Scalar::one(curve);
+        let y = Scalar::from_bytes(&bitwise_shifted_evaluations[0], curve);
+        let combined_y = bl_power.mul(&y);
+        let coeffs = &bitwise_column_coeffs[h_bw_idx];
+        for j in 0..coeffs.len().min(n) {
+            combined[j] = combined[j].add(&bl_power.mul(&coeffs[j]));
+        }
+        combined[0] = combined[0].sub(&combined_y);
+        let q_shifted = scheme.div_by_linear(&combined, &omega_z);
+        let proof_point = scheme.commit_coefficients(&q_shifted);
+        let _ = beta_bw_shifted; // challenge absorbed via transcript
+        Some(BatchProof { d: vec![], proof: proof_point })
     } else {
         None
     };
@@ -1961,6 +3129,36 @@ fn prove_inner_scheme(
         None
     };
 
+    // -----------------------------------------------------------------------
+    // Step 10f: Open frame-perm Z at z, Z at ω·z, and pop selectors at ω·z.
+    // -----------------------------------------------------------------------
+    let frame_perm_open_z = if has_frame_perm {
+        let _ = transcript.challenge_bytes(b"beta_frame_perm");
+        let z_at_z_bytes = frame_perm_eval_z.as_ref().unwrap();
+        let z_at_z = Scalar::from_bytes(z_at_z_bytes, curve);
+        let mut combined = frame_perm_z_coeffs.clone();
+        if combined.len() < n { combined.resize(n, Scalar::zero(curve)); }
+        combined[0] = combined[0].sub(&z_at_z);
+        let q = scheme.div_by_linear(&combined, &z);
+        let p = scheme.commit_coefficients(&q);
+        Some(BatchProof { d: vec![], proof: p })
+    } else { None };
+
+    let frame_perm_open_omega_z = if has_frame_perm {
+        let _ = transcript.challenge_bytes(b"beta_frame_perm_shifted");
+        let omega_z = omega.as_ref().unwrap().mul(&z);
+        let z_at_omega_bytes = frame_perm_eval_omega_z.as_ref().unwrap();
+        let z_at_omega = Scalar::from_bytes(z_at_omega_bytes, curve);
+        let mut combined = frame_perm_z_coeffs.clone();
+        if combined.len() < n { combined.resize(n, Scalar::zero(curve)); }
+        combined[0] = combined[0].sub(&z_at_omega);
+        let q = scheme.div_by_linear(&combined, &omega_z);
+        let p = scheme.commit_coefficients(&q);
+        Some(BatchProof { d: vec![], proof: p })
+    } else { None };
+
+    let frame_perm_pop_shifted_open: Option<BatchProof> = None;
+
     let batch_open_ms = t_batch_open.elapsed().as_millis();
     let total_ms = prove_start.elapsed().as_millis();
 
@@ -1994,6 +3192,11 @@ fn prove_inner_scheme(
         logup_shifted_evaluations,
         logup_opening_proof,
         logup_shifted_opening_proof,
+        bitwise_commitments,
+        bitwise_evaluations: bitwise_evaluations_vec,
+        bitwise_shifted_evaluations,
+        bitwise_opening_proof,
+        bitwise_shifted_opening_proof,
         perm_commitments,
         perm_evaluations: perm_evaluations_vec,
         perm_shifted_evaluations,
@@ -2005,6 +3208,13 @@ fn prove_inner_scheme(
         reg_perm_shifted_evaluations: reg_perm_shifted_evals_vec,
         reg_perm_opening_proof: reg_perm_opening,
         reg_perm_shifted_opening_proof: reg_perm_shifted_opening,
+        frame_perm_commitment: frame_perm_commitment_opt,
+        frame_perm_evaluation: frame_perm_eval_z,
+        frame_perm_shifted_evaluation: frame_perm_eval_omega_z,
+        frame_perm_opening_proof: frame_perm_open_z,
+        frame_perm_shifted_opening_proof: frame_perm_open_omega_z,
+        frame_perm_pop_shifted_evaluations: frame_perm_pop_shifted_evals,
+        frame_perm_pop_shifted_opening_proof: frame_perm_pop_shifted_open,
     }
 }
 
@@ -2055,5 +3265,235 @@ pub fn prove_chunk_with_scheme(
         initial_state_hash: *initial_state_hash,
         final_state_hash: *final_state_hash,
         chunk_index,
+    }
+}
+
+#[cfg(test)]
+mod proof_serde_tests {
+    use super::*;
+
+    fn sample_proof() -> ExecutionProof {
+        ExecutionProof {
+            column_commitments: vec![Commitment(vec![1, 2, 3]), Commitment(vec![4, 5])],
+            quotient_commitments: vec![Commitment(vec![9; 74])],
+            evaluations: vec![vec![10, 11], vec![], vec![20]],
+            opening_proof: BatchProof { d: vec![0xAA, 0xBB], proof: vec![0xCC] },
+            num_steps: 0xDEAD_BEEF_FEED_FACE,
+            domain_size: 256,
+            num_quotient_chunks: 2,
+            shifted_evaluations: vec![vec![1]],
+            shifted_opening_proof: Some(BatchProof { d: vec![1], proof: vec![2, 3] }),
+            logup_commitments: Vec::new(),
+            logup_evaluations: Vec::new(),
+            logup_shifted_evaluations: Vec::new(),
+            logup_opening_proof: None,
+            logup_shifted_opening_proof: None,
+            bitwise_commitments: Vec::new(),
+            bitwise_evaluations: Vec::new(),
+            bitwise_shifted_evaluations: Vec::new(),
+            bitwise_opening_proof: None,
+            bitwise_shifted_opening_proof: None,
+            perm_commitments: vec![Commitment(vec![7])],
+            perm_evaluations: vec![vec![8]],
+            perm_shifted_evaluations: Vec::new(),
+            perm_opening_proof: Some(BatchProof { d: vec![5], proof: vec![6] }),
+            perm_shifted_opening_proof: None,
+            oracle_data: vec![vec![0xCA, 0xFE]],
+            reg_perm_commitments: Vec::new(),
+            reg_perm_evaluations: Vec::new(),
+            reg_perm_shifted_evaluations: Vec::new(),
+            reg_perm_opening_proof: None,
+            reg_perm_shifted_opening_proof: None,
+            frame_perm_commitment: None,
+            frame_perm_evaluation: None,
+            frame_perm_shifted_evaluation: None,
+            frame_perm_opening_proof: None,
+            frame_perm_shifted_opening_proof: None,
+            frame_perm_pop_shifted_evaluations: Vec::new(),
+            frame_perm_pop_shifted_opening_proof: None,
+        }
+    }
+
+    fn assert_round_trip(p: &ExecutionProof) {
+        let bytes = p.to_bytes();
+        let decoded = ExecutionProof::from_bytes(&bytes).expect("decode");
+        assert_eq!(decoded.column_commitments.len(), p.column_commitments.len());
+        for (a, b) in decoded.column_commitments.iter().zip(&p.column_commitments) {
+            assert_eq!(a.0, b.0);
+        }
+        assert_eq!(decoded.quotient_commitments.len(), p.quotient_commitments.len());
+        for (a, b) in decoded.quotient_commitments.iter().zip(&p.quotient_commitments) {
+            assert_eq!(a.0, b.0);
+        }
+        assert_eq!(decoded.evaluations, p.evaluations);
+        assert_eq!(decoded.opening_proof.d, p.opening_proof.d);
+        assert_eq!(decoded.opening_proof.proof, p.opening_proof.proof);
+        assert_eq!(decoded.num_steps, p.num_steps);
+        assert_eq!(decoded.domain_size, p.domain_size);
+        assert_eq!(decoded.num_quotient_chunks, p.num_quotient_chunks);
+        assert_eq!(decoded.shifted_evaluations, p.shifted_evaluations);
+        assert_eq!(decoded.oracle_data, p.oracle_data);
+        // Re-serializing the decoded proof must reproduce identical bytes.
+        assert_eq!(decoded.to_bytes(), bytes, "encoding must be canonical");
+    }
+
+    #[test]
+    fn execution_proof_round_trip_minimal() {
+        assert_round_trip(&sample_proof());
+    }
+
+    #[test]
+    fn execution_proof_round_trip_all_optional_present() {
+        let mut p = sample_proof();
+        p.shifted_opening_proof = Some(BatchProof { d: vec![1], proof: vec![2] });
+        p.logup_opening_proof = Some(BatchProof { d: vec![3], proof: vec![4] });
+        p.logup_shifted_opening_proof = Some(BatchProof { d: vec![5], proof: vec![6] });
+        p.bitwise_opening_proof = Some(BatchProof { d: vec![7], proof: vec![8] });
+        p.bitwise_shifted_opening_proof = Some(BatchProof { d: vec![9], proof: vec![10] });
+        p.perm_shifted_opening_proof = Some(BatchProof { d: vec![11], proof: vec![12] });
+        p.reg_perm_opening_proof = Some(BatchProof { d: vec![13], proof: vec![14] });
+        p.reg_perm_shifted_opening_proof = Some(BatchProof { d: vec![15], proof: vec![16] });
+        assert_round_trip(&p);
+    }
+
+    #[test]
+    fn execution_proof_round_trip_all_optional_absent() {
+        let mut p = sample_proof();
+        p.shifted_opening_proof = None;
+        p.perm_opening_proof = None;
+        assert_round_trip(&p);
+    }
+
+    #[test]
+    fn execution_proof_decode_truncated_fails() {
+        let p = sample_proof();
+        let bytes = p.to_bytes();
+        for trunc in &[1usize, 5, 10, bytes.len() / 2, bytes.len() - 1] {
+            let r = ExecutionProof::from_bytes(&bytes[..*trunc]);
+            assert!(
+                r.is_err(),
+                "truncated to {} bytes must error, got {:?}",
+                trunc,
+                r,
+            );
+        }
+    }
+
+    #[test]
+    fn execution_proof_decode_trailing_bytes_fails() {
+        let p = sample_proof();
+        let mut bytes = p.to_bytes();
+        bytes.extend_from_slice(&[0xFF, 0xFF]);
+        assert_eq!(
+            ExecutionProof::from_bytes(&bytes).err(),
+            Some(ProofDecodeError::TrailingBytes(2)),
+        );
+    }
+
+    #[test]
+    fn execution_proof_decode_invalid_quotient_chunks_fails() {
+        // Zero chunks is the only invalid count (any positive value is
+        // accepted — the advanced prover path emits 3+ chunks for
+        // permutation-grand-product polynomials).
+        let mut p = sample_proof();
+        p.num_quotient_chunks = 0;
+        let bytes = p.to_bytes();
+        assert_eq!(
+            ExecutionProof::from_bytes(&bytes).err(),
+            Some(ProofDecodeError::InvalidQuotientChunks(0)),
+        );
+    }
+
+    #[test]
+    fn execution_proof_decode_accepts_high_quotient_chunk_counts() {
+        // The prover's permutation/regperm path can emit 3-4 quotient
+        // chunks. Make sure the decoder doesn't reject them.
+        for chunks in &[3u8, 4, 7] {
+            let mut p = sample_proof();
+            p.num_quotient_chunks = *chunks;
+            let bytes = p.to_bytes();
+            let decoded = ExecutionProof::from_bytes(&bytes).expect("must decode");
+            assert_eq!(decoded.num_quotient_chunks, *chunks);
+        }
+    }
+
+    #[test]
+    fn execution_proof_canonical_encoding_is_stable() {
+        let p = sample_proof();
+        assert_eq!(p.to_bytes(), p.to_bytes());
+    }
+
+    fn sample_chunk_proof() -> ChunkProof {
+        ChunkProof {
+            execution_proof: sample_proof(),
+            initial_state_hash: [0xAA; 32],
+            final_state_hash: [0xBB; 32],
+            chunk_index: 0xCAFE_BEEF_DEAD_BABE,
+        }
+    }
+
+    fn assert_chunk_round_trip(p: &ChunkProof) {
+        let bytes = p.to_bytes();
+        let decoded = ChunkProof::from_bytes(&bytes).expect("decode");
+        assert_eq!(decoded.initial_state_hash, p.initial_state_hash);
+        assert_eq!(decoded.final_state_hash, p.final_state_hash);
+        assert_eq!(decoded.chunk_index, p.chunk_index);
+        assert_eq!(decoded.execution_proof.num_steps, p.execution_proof.num_steps);
+        assert_eq!(decoded.execution_proof.domain_size, p.execution_proof.domain_size);
+        assert_eq!(decoded.to_bytes(), bytes, "encoding must be canonical");
+    }
+
+    #[test]
+    fn chunk_proof_round_trip_minimal() {
+        assert_chunk_round_trip(&sample_chunk_proof());
+    }
+
+    #[test]
+    fn chunk_proof_decode_truncated_fails() {
+        let p = sample_chunk_proof();
+        let bytes = p.to_bytes();
+        for trunc in &[0usize, 1, 3, 5, bytes.len() / 2, bytes.len() - 1] {
+            let r = ChunkProof::from_bytes(&bytes[..*trunc]);
+            assert!(
+                r.is_err(),
+                "truncated to {} bytes must error, got Ok",
+                trunc,
+            );
+        }
+    }
+
+    #[test]
+    fn chunk_proof_decode_trailing_bytes_fails() {
+        let p = sample_chunk_proof();
+        let mut bytes = p.to_bytes();
+        bytes.extend_from_slice(&[0xFF, 0xFF]);
+        assert_eq!(
+            ChunkProof::from_bytes(&bytes).err(),
+            Some(ProofDecodeError::TrailingBytes(2)),
+        );
+    }
+
+    #[test]
+    fn chunk_proof_inner_proof_decode_error_propagates() {
+        let p = sample_chunk_proof();
+        let mut bytes = p.to_bytes();
+        // Corrupt the inner ExecutionProof body — the embedded
+        // num_quotient_chunks byte. Find it by knowing the inner length
+        // is the first 4 BE bytes.
+        let inner_len = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+        // Set a byte inside the inner range to a wild value that breaks
+        // some interior length prefix.
+        bytes[5] = 0xFF;
+        bytes[6] = 0xFF;
+        bytes[7] = 0xFF;
+        bytes[8] = 0xFF;
+        let r = ChunkProof::from_bytes(&bytes);
+        assert!(r.is_err(), "corrupted inner proof must surface as error");
+        // Sanity: untouched len prefix is the same.
+        let bytes2 = p.to_bytes();
+        assert_eq!(
+            u32::from_be_bytes([bytes2[0], bytes2[1], bytes2[2], bytes2[3]]) as usize,
+            inner_len,
+        );
     }
 }

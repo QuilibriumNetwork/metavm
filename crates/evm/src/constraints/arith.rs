@@ -397,16 +397,20 @@ pub fn evaluate_borrow3_binary_raw(col_evals: &[Scalar]) -> Scalar {
 
 // --- MUL constraint raw functions ---
 //
-// Full 256-bit schoolbook MUL: a * b = output (mod 2^256) + overflow in aux0
-// Using 4x64-bit limbs with carry chain stored in aux1:
+// Full 256-bit schoolbook MUL: a * b = output (mod 2^256). Using 4×64-bit
+// limbs with carry chain stored in aux1 (c0..c3):
 //
-// limb 0: a0*b0 = c0*2^64 + out0                          (c0 in aux1_l0)
-// limb 1: a0*b1 + a1*b0 + c0 = c1*2^64 + out1             (c1 in aux1_l1)
-// limb 2: a0*b2 + a1*b1 + a2*b0 + c1 = c2*2^64 + out2     (c2 in aux1_l2)
-// limb 3: a0*b3 + a1*b2 + a2*b1 + a3*b0 + c2 = c3*2^64 + out3 (c3 in aux1_l3)
+// limb 0: a0·b0                              = c0·2^64 + out0   (c0 in aux1_l0)
+// limb 1: a0·b1 + a1·b0 + c0                 = c1·2^64 + out1   (c1 in aux1_l1)
+// limb 2: a0·b2 + a1·b1 + a2·b0 + c1         = c2·2^64 + out2   (c2 in aux1_l2)
+// limb 3: a0·b3 + a1·b2 + a2·b1 + a3·b0 + c2 = c3·2^64 + out3   (c3 in aux1_l3)
 //
-// Note: EVM MUL wraps at 2^256 — we don't constrain the upper 256 bits (aux0).
-// The carries c0-c3 are range-checked via LogUp declarations.
+// EVM MUL outputs only the low 256 bits, so the upper-half schoolbook
+// (limbs 4..7) is intentionally not constrained: aux0 on MUL rows is
+// unused storage (declared as a 64-bit range check for defensive
+// well-formedness; no other constraint reads it). Adding the upper-half
+// schoolbook would let aux0 carry the high 256 bits of the 512-bit
+// product — useful for MULMOD's intermediate, not for plain MUL.
 
 /// MUL limb 0: a0*b0 - c0*2^64 - out0 = 0
 pub fn evaluate_arith_mul_limb0_raw(col_evals: &[Scalar]) -> Scalar {

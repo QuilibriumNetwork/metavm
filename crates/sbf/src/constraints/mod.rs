@@ -1333,6 +1333,42 @@ mod tests {
         assert!(valid, "SBF BLS12-381 scheme prove/verify should succeed");
     }
 
+    /// Regression: real SBF ChunkProof must verify through
+    /// `begin_chunk_scheme` + `verify_final_scheme` (the recursive
+    /// accumulator path the prove-sbf / prove-slot CLIs use).
+    ///
+    /// Companion to the EVM and RISC-V regressions. Locks in the
+    /// bitwise transcript fix in
+    /// `recursive::recover_chunk_challenges_scheme`.
+    #[test]
+    #[ignore = "slow: full prove + recursive verify on SBF trace; run with --release --ignored"]
+    fn sbf_chunk_proof_verifies_through_recursive_accumulator() {
+        use metavm_zkp::prover::prove_chunk_with_scheme;
+        use metavm_zkp::recursive::{begin_chunk_scheme, verify_final_scheme};
+        use metavm_zkp::scheme::bls48581_scheme::Bls48581Scheme;
+        use metavm_zkp::scheme::CommitmentScheme;
+
+        let curve = CurveType::Bls48581;
+        let scheme = Bls48581Scheme::new();
+        scheme.init();
+
+        let trace = make_add_trace();
+        let polys = metavm_zkp::trace::TracePolynomials::from_vm_trace(&trace, curve);
+        let cs = SbfConstraintSystem::new();
+
+        let zero = [0u8; 32];
+        let chunk_proof = prove_chunk_with_scheme(&polys, &cs, 0, &zero, &zero, &scheme);
+
+        let recursive = begin_chunk_scheme(chunk_proof, &scheme, curve);
+        let valid = verify_final_scheme(&recursive, &scheme);
+        assert!(
+            valid,
+            "SBF ChunkProof must verify through recursive accumulator \
+             (regression guard for the bitwise transcript fix in \
+             `recover_chunk_challenges_scheme`)",
+        );
+    }
+
     /// Create a 5-instruction trace: mov+mov+add+mov+exit
     fn make_multi_insn_trace() -> SbfTraceColumns {
         let mut trace = SbfTraceColumns::new();

@@ -260,7 +260,15 @@ pub fn evaluate_permutation_constraints_at_point(
         let sa_z = &perm_col_evals_at_z[layout.sorted_addr];
         let sa_wz = &perm_shifted_evals[layout.sorted_addr];
         let isa_wz = &perm_shifted_evals[layout.is_same_addr];
-        let inv_diff = &perm_col_evals_at_z[layout.inv_addr_diff];
+        // BUG FIX 2026-05-12: inv_addr_diff must use the SHIFTED evaluation
+        // (ω·z) — not the at-z one — so it references the same transition
+        // as is_same_addr(ω·z). Previously, this constraint used
+        // inv_addr_diff(z) which tracks the (z-1 → z) transition, while
+        // is_same_addr(ω·z) tracks (z → ω·z). The mismatch left the
+        // constraint non-vanishing on rows where the addr changes,
+        // breaking the quotient polynomial division. See
+        // memory/mstore8_memory_perm_fix.md.
+        let inv_diff = &perm_shifted_evals[layout.inv_addr_diff];
 
         // Constraint 2: is_same_addr(ω·z) * (sorted_addr(ω·z) - sorted_addr(z)) = 0
         let addr_diff = sa_wz.sub(sa_z);
@@ -268,7 +276,8 @@ pub fn evaluate_permutation_constraints_at_point(
         result = result.add(&ap.mul(&body2).mul(&exclusion));
         ap = ap.mul(alpha);
 
-        // Constraint 3: (1 - is_same_addr(ω·z)) * (1 - addr_diff * inv_addr_diff) = 0
+        // Constraint 3: (1 - is_same_addr(ω·z)) * (1 - addr_diff · inv_addr_diff(ω·z)) = 0
+        // Both flags reference the (z → ω·z) transition.
         let body3 = one.sub(isa_wz).mul(&one.sub(&addr_diff.mul(inv_diff)));
         result = result.add(&ap.mul(&body3).mul(&exclusion));
         ap = ap.mul(alpha);
@@ -308,6 +317,7 @@ pub fn evaluate_grand_product_at_point(
     layout: &MemoryPermutationLayout,
     addr_col: usize,
     val_cols: &[usize],
+    load_sels: &[usize],
     store_sels: &[usize],
     gamma: &Scalar,
     delta: &Scalar,
@@ -325,16 +335,31 @@ pub fn evaluate_grand_product_at_point(
     }
     let mut result = Scalar::zero(curve);
 
-    // Compute numer(z) = γ + addr(z) + δ·val_combined(z) + δ²·ts(z) + δ³·rw(z)
+    // Compute numer(z) = γ + effective_addr(z) + δ·val_combined(z) + δ²·ts(z) + δ³·rw(z)
     let delta2 = delta.mul(delta);
     let delta3 = delta2.mul(delta);
 
-    let addr_z = &col_evals_at_z[addr_col];
     // rw = sum of all store selector evaluations at z
     let mut rw_z = Scalar::zero(curve);
     for &ss in store_sels {
         rw_z = rw_z.add(&col_evals_at_z[ss]);
     }
+    // real_mem(z) = sum_of_all_load_sels + sum_of_all_store_sels
+    // = 1 on memory rows, 0 on non-memory rows. Selectors are mutually
+    // exclusive (sum-to-one constraint), so this is exactly binary.
+    let mut real_mem_z = rw_z.clone();
+    for &ls in load_sels {
+        real_mem_z = real_mem_z.add(&col_evals_at_z[ls]);
+    }
+    // effective_addr(z) = real_mem · addr(z) + (1 - real_mem) · SENTINEL
+    // On non-mem rows, use a sentinel addr (u64::MAX) so dummies don't
+    // collide with real memory accesses at addr=0 in the sorted order.
+    // Matches the prover's `accesses` vector dummy convention (see
+    // mstore8_memory_perm_fix.md fix landed 2026-05-12).
+    let addr_z_raw = &col_evals_at_z[addr_col];
+    let sentinel = Scalar::from_u64(u64::MAX, curve);
+    let one_minus_real_mem = one.sub(&real_mem_z);
+    let addr_z = real_mem_z.mul(addr_z_raw).add(&one_minus_real_mem.mul(&sentinel));
     let ts_z = &perm_col_evals_at_z[layout.original_ts];
 
     let val_combined_z = if val_cols.len() == 1 {
@@ -350,7 +375,7 @@ pub fn evaluate_grand_product_at_point(
         combined
     };
 
-    let numer_z = gamma.add(addr_z)
+    let numer_z = gamma.add(&addr_z)
         .add(&delta.mul(&val_combined_z))
         .add(&delta2.mul(ts_z))
         .add(&delta3.mul(&rw_z));
@@ -656,6 +681,287 @@ pub fn evaluate_register_perm_at_point(
     result = result.add(&ap.mul(&body_boundary));
 
     result
+}
+
+// ── Frame-stack LIFO multiset permutation ──────────────────────────────
+//
+// Pairs every frame-PUSH event in the trace
+// (CALL/CALLCODE/DELEGATECALL/CREATE/CREATE2/STATICCALL) with a matching
+// frame-POP event (RETURN/REVERT) keyed on the full 17-component tuple
+// `(depth, caller_l0..3, callee_l0..3, value_l0..3, return_pc,
+// return_offset, return_size, is_static, gas)`. The PUSH side reads the
+// tuple from the row where the push selector fires (the parent frame
+// being saved). The POP side reads the SHIFTED tuple — i.e. the tuple
+// from row+1 — which is the parent frame being restored on the next row.
+//
+// Because the tuples are keyed on (depth, ...), sibling-call swap attacks
+// (push at depth D₁, push at D₂, pop at D₂ with D₁'s frame) are caught:
+// the multiset of (depth, frame) on push side ≠ pop side.
+//
+// Single auxiliary witness column Z. Constraints:
+//   - transition: Z(ω·z) · pop_factor(z) - Z(z) · push_factor(z) = 0
+//   - boundary:   L_0(z) · (Z(z) - 1) = 0
+// No exclusion factor on the transition: padding rows have
+// is_push = is_pop = 0 so push_factor = pop_factor = 1, and the wrap row
+// closes the multiset (Z(ω^0) = Z(ω^{n-1}) · 1 · 1 · ... = 1 forces the
+// product over real rows to equal 1, i.e. multiset equality).
+
+/// Layout of frame-stack permutation auxiliary columns.
+///
+/// Single column: the grand-product accumulator Z. The push/pop tuples
+/// are read directly from the EVM trace's frame-state columns by both
+/// prover and verifier — there is no sorted side.
+#[derive(Debug, Clone)]
+pub struct FrameStackPermLayout {
+    /// Offset of Z accumulator (from the start of frame-perm columns).
+    pub z_column: usize,
+    /// Total number of frame-perm columns.
+    pub num_columns: usize,
+    /// Trace-column indices forming the 17-component tuple, in order.
+    /// Layout (matching the spec): [depth, caller_l0..3, callee_l0..3,
+    /// value_l0..3, return_pc, return_offset, return_size, is_static, gas].
+    pub tuple_columns: Vec<usize>,
+    /// Trace-column indices of selectors that contribute a PUSH event.
+    pub push_selectors: Vec<usize>,
+    /// Trace-column indices of selectors that contribute a POP event.
+    pub pop_selectors: Vec<usize>,
+}
+
+impl FrameStackPermLayout {
+    /// Total constraints for the frame-stack permutation argument.
+    /// 1 grand-product transition + 1 boundary = 2.
+    pub const NUM_CONSTRAINTS: usize = 2;
+}
+
+/// Compute the per-row tuple weighting factor `t(z) = γ + Σ δ^(k+1) · col_k(z)`.
+///
+/// `col_evals[k]` is the k-th tuple-column's evaluation at the current
+/// row. Returns the weighted sum that becomes the numerator/denominator
+/// of the grand product.
+pub fn frame_perm_tuple_factor(
+    col_evals: &[Scalar],
+    gamma: &Scalar,
+    delta: &Scalar,
+) -> Scalar {
+    let mut acc = gamma.clone();
+    let mut delta_pow = delta.clone();
+    for ev in col_evals {
+        acc = acc.add(&delta_pow.mul(ev));
+        delta_pow = delta_pow.mul(delta);
+    }
+    acc
+}
+
+/// Compute the Z column for the frame-stack permutation.
+///
+/// `tuple_per_row[i]` is the i-th row's 17-component tuple (push side).
+/// `tuple_shifted_per_row[i]` is the (i+1 mod n)-th row's tuple (pop
+/// side, evaluated on the SHIFTED column). `is_push[i]` and `is_pop[i]`
+/// are the per-row scalar flags (sums of the relevant selectors,
+/// guaranteed binary by selector sum-to-one).
+///
+/// Returns the n-element Z column: Z[0] = 1; Z[i+1] = Z[i] *
+/// push_factor(i) / pop_factor(i). The multiset closes ⟺ Z[n-1] *
+/// push_factor(n-1) / pop_factor(n-1) = 1, which by transitivity equals
+/// Z[0] (cyclic).
+pub fn compute_frame_perm_z(
+    tuple_per_row: &[Vec<Scalar>],
+    tuple_shifted_per_row: &[Vec<Scalar>],
+    is_push: &[Scalar],
+    is_pop: &[Scalar],
+    gamma: &Scalar,
+    delta: &Scalar,
+    curve: CurveType,
+) -> Vec<Scalar> {
+    let n = tuple_per_row.len();
+    debug_assert_eq!(tuple_shifted_per_row.len(), n);
+    debug_assert_eq!(is_push.len(), n);
+    debug_assert_eq!(is_pop.len(), n);
+
+    let mut z = vec![Scalar::one(curve); n];
+    let one = Scalar::one(curve);
+
+    for i in 0..n.saturating_sub(1) {
+        let t_push = frame_perm_tuple_factor(&tuple_per_row[i], gamma, delta);
+        let t_pop = frame_perm_tuple_factor(&tuple_shifted_per_row[i], gamma, delta);
+        // push_factor = is_push * t_push + (1 - is_push)
+        let push_factor = is_push[i].mul(&t_push).add(&one.sub(&is_push[i]));
+        // pop_factor = is_pop * t_pop + (1 - is_pop)
+        let pop_factor = is_pop[i].mul(&t_pop).add(&one.sub(&is_pop[i]));
+        let pop_inv = pop_factor.inverse();
+        z[i + 1] = z[i].mul(&push_factor).mul(&pop_inv);
+    }
+
+    z
+}
+
+/// Evaluate the frame-stack permutation transition + boundary at a
+/// single point z.
+///
+/// Returns Σ α^(offset+i) · constraint_i(z), where:
+///   constraint_0(z) = Z(ω·z) · pop_factor(z) - Z(z) · push_factor(z)
+///   constraint_1(z) = L_0(z) · (Z(z) - 1)
+///
+/// `tuple_at_z` and `tuple_at_omega_z` are evaluations of the 17 tuple
+/// columns at z and ω·z respectively (taken from the main trace's
+/// shifted opening, NOT from a separate column). `is_push_at_z` is the
+/// sum of push-selector evaluations at z (similarly for pop and ω·z).
+pub fn evaluate_frame_perm_at_point(
+    z_at_z: &Scalar,
+    z_at_omega_z: &Scalar,
+    tuple_at_z: &[Scalar],
+    tuple_at_omega_z: &[Scalar],
+    is_push_at_z: &Scalar,
+    is_pop_at_z: &Scalar,
+    gamma: &Scalar,
+    delta: &Scalar,
+    z: &Scalar,
+    domain_size: u64,
+    alpha: &Scalar,
+    alpha_offset: usize,
+) -> Scalar {
+    let curve = alpha.curve_type();
+    let one = Scalar::one(curve);
+
+    let mut ap = Scalar::one(curve);
+    for _ in 0..alpha_offset {
+        ap = ap.mul(alpha);
+    }
+
+    // Tuple weighting at z (push side) and at ω·z (pop side: a pop on
+    // row z restores the parent frame whose state appears on row ω·z).
+    let t_push_at_z = frame_perm_tuple_factor(tuple_at_z, gamma, delta);
+    let t_pop_at_omega_z = frame_perm_tuple_factor(tuple_at_omega_z, gamma, delta);
+
+    // push_factor(z) = is_push(z) · t_push(z) + (1 - is_push(z))
+    let push_factor = is_push_at_z.mul(&t_push_at_z).add(&one.sub(is_push_at_z));
+    // pop_factor(z) = is_pop(z) · t_pop(ω·z) + (1 - is_pop(z))
+    //
+    // is_pop(z) tells us whether row z is a pop event; the tuple it
+    // restores is the parent-frame state on the NEXT row (ω·z).
+    let pop_factor = is_pop_at_z.mul(&t_pop_at_omega_z).add(&one.sub(is_pop_at_z));
+
+    // Transition: Z(ω·z) · pop_factor(z) - Z(z) · push_factor(z) = 0
+    let body_gp = z_at_omega_z.mul(&pop_factor).sub(&z_at_z.mul(&push_factor));
+    let mut result = ap.mul(&body_gp);
+    ap = ap.mul(alpha);
+
+    // Boundary: L_0(z) · (Z(z) - 1) = 0
+    let n = domain_size;
+    let n_scalar = Scalar::from_u64(n, curve);
+    let mut z_n = Scalar::one(curve);
+    {
+        let mut base = z.clone();
+        let mut exp = n;
+        while exp > 0 {
+            if exp & 1 == 1 { z_n = z_n.mul(&base); }
+            base = base.mul(&base);
+            exp >>= 1;
+        }
+    }
+    let z_n_minus_1 = z_n.sub(&one);
+    let z_minus_1 = z.sub(&one);
+    let denom_l0 = n_scalar.mul(&z_minus_1);
+    let l0_z = if !denom_l0.is_zero() {
+        z_n_minus_1.mul(&denom_l0.inverse())
+    } else {
+        one.clone()
+    };
+    let body_boundary = l0_z.mul(&z_at_z.sub(&one));
+    result = result.add(&ap.mul(&body_boundary));
+
+    result
+}
+
+/// Build the frame-stack permutation polynomial contribution in
+/// coefficient form, ready to be added into the C(X) polynomial.
+///
+/// Both bodies are full polynomials over the domain (no exclusion
+/// factor — see the module-level comment for why padding closes the
+/// multiset). Returns the contribution; caller is responsible for
+/// adding to C and bumping the alpha offset by 2.
+pub fn build_frame_perm_polynomial(
+    z_coeffs: &[Scalar],
+    z_shifted_coeffs: &[Scalar],
+    tuple_coeffs: &[Vec<Scalar>],
+    tuple_shifted_coeffs: &[Vec<Scalar>],
+    is_push_coeffs: &[Scalar],
+    is_pop_coeffs: &[Scalar],
+    gamma: &Scalar,
+    delta: &Scalar,
+    domain_size: u64,
+    alpha: &Scalar,
+    alpha_offset: usize,
+) -> Vec<Scalar> {
+    use crate::poly_arith;
+    let curve = alpha.curve_type();
+    let n = domain_size as usize;
+
+    let mut ap = Scalar::one(curve);
+    for _ in 0..alpha_offset {
+        ap = ap.mul(alpha);
+    }
+
+    let one_poly: Vec<Scalar> = {
+        let mut p = vec![Scalar::zero(curve); n];
+        p[0] = Scalar::one(curve);
+        p
+    };
+    let gamma_poly: Vec<Scalar> = {
+        let mut p = vec![Scalar::zero(curve); n];
+        p[0] = gamma.clone();
+        p
+    };
+
+    // Build t_push(X) = γ + δ · col_0(X) + δ² · col_1(X) + ... in coeff form.
+    let build_tuple_poly = |cols: &[Vec<Scalar>]| -> Vec<Scalar> {
+        let mut acc = gamma_poly.clone();
+        let mut delta_pow = delta.clone();
+        for c in cols {
+            let scaled = poly_arith::poly_scalar_mul(c, &delta_pow);
+            acc = poly_arith::poly_add(&acc, &scaled, curve);
+            delta_pow = delta_pow.mul(delta);
+        }
+        acc
+    };
+
+    let t_push_poly = build_tuple_poly(tuple_coeffs);
+    let t_pop_poly = build_tuple_poly(tuple_shifted_coeffs);
+
+    // push_factor(X) = is_push(X) · t_push(X) + (1 - is_push(X))
+    let one_minus_push = poly_arith::poly_sub(&one_poly, is_push_coeffs, curve);
+    let push_factor = poly_arith::poly_add(
+        &poly_arith::poly_mul(is_push_coeffs, &t_push_poly, curve),
+        &one_minus_push,
+        curve,
+    );
+
+    // pop_factor(X) = is_pop(X) · t_pop(X) + (1 - is_pop(X))
+    // where t_pop already uses tuple-shifted columns (i.e. tuple at ω·X).
+    let one_minus_pop = poly_arith::poly_sub(&one_poly, is_pop_coeffs, curve);
+    let pop_factor = poly_arith::poly_add(
+        &poly_arith::poly_mul(is_pop_coeffs, &t_pop_poly, curve),
+        &one_minus_pop,
+        curve,
+    );
+
+    // body_gp(X) = Z(ω·X) · pop_factor(X) - Z(X) · push_factor(X)
+    let term1 = poly_arith::poly_mul(z_shifted_coeffs, &pop_factor, curve);
+    let term2 = poly_arith::poly_mul(z_coeffs, &push_factor, curve);
+    let body_gp = poly_arith::poly_sub(&term1, &term2, curve);
+    let mut acc = poly_arith::poly_scalar_mul(&body_gp, &ap);
+    ap = ap.mul(alpha);
+
+    // body_boundary(X) = L_0(X) · (Z(X) - 1).  L_0(X) = (1/n) · Σ X^k.
+    let n_inv = Scalar::from_u64(n as u64, curve).inverse();
+    let l0_coeffs: Vec<Scalar> = vec![n_inv; n];
+    let z_minus_one = poly_arith::poly_sub(z_coeffs, &one_poly, curve);
+    let body_boundary = poly_arith::poly_mul(&l0_coeffs, &z_minus_one, curve);
+    let scaled_boundary = poly_arith::poly_scalar_mul(&body_boundary, &ap);
+    acc = poly_arith::poly_add(&acc, &scaled_boundary, curve);
+    let _ = ap;
+
+    acc
 }
 
 #[cfg(test)]

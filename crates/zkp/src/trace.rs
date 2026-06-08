@@ -44,6 +44,7 @@ pub struct Polynomial {
 ///
 /// Columns are stored generically as a `Vec<Polynomial>`. The meaning of
 /// each column index is defined by the VM-specific constraint system.
+#[derive(Clone)]
 pub struct TracePolynomials {
     pub columns: Vec<Polynomial>,
     /// Number of actual trace rows (before padding).

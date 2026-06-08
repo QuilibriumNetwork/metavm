@@ -68,9 +68,69 @@ The final proof is a single accumulated claim verified by one pairing: `e(L_acc,
 
 BLS12-381 uses NTT-based polynomial multiplication (O(n log n)) for domains >= 64. BLS48-581 falls back to naive convolution. Both use Pippenger MSM for commitments. The `bls48581-fast` variant uses optimized FFT with precomputed roots of unity.
 
+## Proving Transaction Inclusion to Economic Finality
+
+A single proof can attest the full claim: **this transaction executed correctly → it is included in this execution block → that block is carried by this beacon block → that beacon block is finalized by Casper FFG with a 2/3 stake-weighted supermajority.** Four layers, chained by cryptographic equalities, proven and verified in one `joint_prove` / `joint_verify` call. The end-to-end driver is `integration_finality_proof_master_joint_prove::honest_round_trip`.
+
+No single AIR proves all of this. Instead, ~10 specialized AIRs each prove one link, and **cross-AIR LogUp descriptors** algebraically bind a column in one AIR to a column in the next, so the verifier knows the same hash/root/epoch flows unbroken across each seam. A joint γ challenge is derived from the shared Fiat-Shamir transcript, so the LogUp closures across AIRs are bound to the same randomness — this is what makes the seams sound rather than two independent claims that happen to share a number.
+
+### Layers and seams
+
+```
+Layer A  tx execution     tx_full_chain_air + receipt_status_air + withdrawal_root_air
+   |  D0:  tx_index  <->  block.transactions_root[0]
+Layer B  Ethereum block   block_header_air + multi_block_proof_air
+   |  D1:  block_hash agrees across header <-> multi-block chain
+   |  D2:  block.state_root[0]  <->  beacon body_root projection
+Layer C  beacon chain      bbh_root_consumer_air + beacon_state_transition_air + block_full_proof_air
+   |  D3:  post_state_root carried forward across slots
+   |  D4:  block_hash agrees across block-proof <-> header
+   |  D5:  epoch at boundary row  <->  FFG target_epoch (gated IS_FINALIZED)
+Layer D  finality          casper_ffg_chain_air + finality_constraints
+        D6:  FFG vote_count  <->  stake-weighted running_total (gated SEL_THRESHOLD)
+```
+
+Each `Dn` is a single-column tuple descriptor. They are the load-bearing part: D2 is where the execution state-root enters the beacon body, D5 is where the finalized epoch meets the block's slot, D6 is where "finalized" actually means "2/3 of staked ETH attested." Break any one and `closure_a != closure_b`, and `joint_verify` rejects.
+
+### Composition recipe
+
+```rust
+// 1. Build a witness per layer-AIR (the actual transaction/block/beacon/finality data)
+let tf_w = build_tf_witness();  let rs_w = build_rs_witness();  /* ...10 witnesses... */
+
+// 2. Lower each witness to a trace (column polynomials)
+let tf_trace = tf::build_trace_polynomials(&tf_w, curve);  /* ...10 traces... */
+
+// 3. Instantiate each constraint system (the per-AIR algebraic rules)
+let tf_cs = tf::TxFullChainConstraintSystem::new(tf_trace.num_rows);  /* ...10 systems... */
+
+// 4. Pair traces with their constraint systems, gather the 7 cross-layer descriptors
+let traces  = vec![(&tf_trace, &tf_cs as &dyn VmConstraintSystem), /* ... */];
+let linkages = all_descriptors();   // D0..D6
+
+// 5. ONE joint proof over all 10 AIRs + 7 linkages
+let (proofs, ext) = joint_prove(&traces, &linkages, &scheme)?;
+
+// 6. Verify: every per-AIR proof + every cross-layer closure must hold
+joint_verify(&proofs, &cs_refs, &linkages, &ext, &scheme, curve);  // -> true
+```
+
+`joint_prove` simultaneously proves each AIR's row constraints (the EVM executed the opcodes, the FFG running total reached 2/3), runs the per-AIR LogUp/permutation arguments (memory, range checks), and binds the D0..D6 closures to the joint transcript challenge.
+
+### From demo witness to a real proof
+
+The `honest_round_trip` witness is the canonical **1-tx / 1-block / 1-BBH / 1-finalization** shape — enough to validate the composition end-to-end. A production proof of a *specific* mainnet transaction requires feeding real witnesses in at the bottom:
+
+1. **Real EVM execution** — drive `prove-block` / `prove-evm` (the EVM AIRs) on the actual transaction trace so Layer A commits to genuine opcode execution and the real receipt, not a summary row.
+2. **Real MPT inclusion** — the transaction's `transactionsRoot` / `receiptsRoot` / account `state_root` Merkle-Patricia paths (the `mpt_*` AIRs, including the wide-leaf AIR) so D0/D2 anchor to actual trie contents rather than a byte-0 stand-in.
+3. **Real beacon SSZ** — the `BeaconBlockHeader` → body → execution-payload HTR chain (the `bbh_*` / `execution_payload` AIRs) so D2/D3 carry the genuine `state_root` through the SSZ tree.
+4. **Real attestation set** — the actual validator stakes and BLS-aggregate signature over the finalized checkpoint (the `casper_ffg` + `finality` + BLS pairing AIRs) so D6's running total reflects real staked ETH.
+
+Most of these leaf-level AIRs already exist and are individually validated. The master composer currently binds them at byte-0 anchor / single-column-tuple granularity because `joint_prove`'s linkage API takes `a_columns.len() == 1`. The remaining work to go from structurally-complete demo to a proof of a concrete mainnet transaction is widening those single-column anchors to full 32-byte-tuple bindings and threading the real leaf witnesses in — not adding new layers.
+
 ## Building
 
-Requires the `ceremonyclient` crates at `../ceremonyclient/crates/` relative to this workspace.
+Requires the `monorepo` crates at `../monorepo/crates/` relative to this workspace.
 
 ```bash
 # Build all crates

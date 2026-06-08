@@ -424,6 +424,57 @@ fn main() {
                                 t.aux1[3][row_idx],
                             ],
                             next_pc: t.next_pc[row_idx],
+                            frame: metavm_evm::trace::FrameState {
+                                depth: t.frame_depth[row_idx],
+                                caller: [
+                                    t.frame_caller[0][row_idx],
+                                    t.frame_caller[1][row_idx],
+                                    t.frame_caller[2][row_idx],
+                                    t.frame_caller[3][row_idx],
+                                ],
+                                callee: [
+                                    t.frame_callee[0][row_idx],
+                                    t.frame_callee[1][row_idx],
+                                    t.frame_callee[2][row_idx],
+                                    t.frame_callee[3][row_idx],
+                                ],
+                                value: [
+                                    t.frame_value[0][row_idx],
+                                    t.frame_value[1][row_idx],
+                                    t.frame_value[2][row_idx],
+                                    t.frame_value[3][row_idx],
+                                ],
+                                gas: t.frame_gas[row_idx],
+                                return_pc: t.frame_return_pc[row_idx],
+                                return_offset: t.frame_return_offset[row_idx],
+                                return_size: t.frame_return_size[row_idx],
+                                is_static: t.frame_static[row_idx],
+                            },
+                            create_address_hint: [
+                                t.create_address_hint[0][row_idx],
+                                t.create_address_hint[1][row_idx],
+                                t.create_address_hint[2][row_idx],
+                                t.create_address_hint[3][row_idx],
+                            ],
+                            create_nonce_hint: t.create_nonce_hint[row_idx],
+                            sel_stop_pop: t.sel_stop_pop[row_idx],
+                            create2_salt_hint: [
+                                t.create2_salt_hint[0][row_idx],
+                                t.create2_salt_hint[1][row_idx],
+                                t.create2_salt_hint[2][row_idx],
+                                t.create2_salt_hint[3][row_idx],
+                            ],
+                            create2_initcode_hash_hint: [
+                                t.create2_initcode_hash_hint[0][row_idx],
+                                t.create2_initcode_hash_hint[1][row_idx],
+                                t.create2_initcode_hash_hint[2][row_idx],
+                                t.create2_initcode_hash_hint[3][row_idx],
+                            ],
+                            tx_origin: [0u64; 4],
+                            tx_gas_price: 0,
+                            tx_calldata_size: 0,
+                            tx_code_size: 0,
+                            returndata_size: 0,
                         };
                         merged_trace.push_row(&row);
                     }

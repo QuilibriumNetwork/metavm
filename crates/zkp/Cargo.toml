@@ -15,6 +15,11 @@ blst = { workspace = true }
 ed448-bulletproofs = { workspace = true }
 verenc = { workspace = true }
 rayon = { workspace = true }
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+ripemd = "0.1.3"
+blake2 = "0.10"
+num-bigint = "0.4"
+num-traits = "0.2"
 
 [dev-dependencies]
 rand = { workspace = true }

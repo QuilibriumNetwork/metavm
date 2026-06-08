@@ -2749,4 +2749,93 @@ mod tests {
         );
         assert!(valid, "RISC-V BLS12-381 scheme prove/verify should succeed");
     }
+
+    /// Regression: real RISC-V ChunkProof must verify through
+    /// `begin_chunk_scheme` + `verify_final_scheme` (the recursive
+    /// accumulator path the prove-elf / prove-boot CLIs use).
+    ///
+    /// Companion to the EVM regression in
+    /// `metavm-evm/src/constraints/mod.rs::evm_chunk_proof_verifies_through_recursive_accumulator`.
+    /// Locks in the bitwise transcript fix in
+    /// `recursive::recover_chunk_challenges_scheme`.
+    #[test]
+    #[ignore = "slow: full prove + recursive verify on RISC-V trace; run with --release --ignored"]
+    fn riscv_chunk_proof_verifies_through_recursive_accumulator() {
+        use metavm_zkp::prover::prove_chunk_with_scheme;
+        use metavm_zkp::recursive::{begin_chunk_scheme, verify_final_scheme};
+        use metavm_zkp::scheme::bls48581_scheme::Bls48581Scheme;
+        use metavm_zkp::scheme::CommitmentScheme;
+
+        let curve = metavm_zkp::field::CurveType::Bls48581;
+        let scheme = Bls48581Scheme::new();
+        scheme.init();
+
+        let columns = make_valid_trace(4);
+        let polys = super::trace_polys_from_columns(&columns);
+        let cs = RiscvConstraintSystem::full();
+
+        let zero = [0u8; 32];
+        let chunk_proof = prove_chunk_with_scheme(&polys, &cs, 0, &zero, &zero, &scheme);
+
+        let recursive = begin_chunk_scheme(chunk_proof, &scheme, curve);
+        let valid = verify_final_scheme(&recursive, &scheme);
+        assert!(
+            valid,
+            "RISC-V ChunkProof must verify through recursive accumulator \
+             (regression guard for the bitwise transcript fix in \
+             `recover_chunk_challenges_scheme`)",
+        );
+    }
+
+    /// The recursive scalar accumulator must reject a tampered constraint
+    /// evaluation. RISC-V exercises the full set of auxiliary contributions
+    /// (logup + memory perm + register perm + bitwise), so this verifies
+    /// every branch of `verifier::compute_c_at_z` feeds into the per-chunk
+    /// `c_check = Q(z)·Z_H(z) - C(z)` accumulator.
+    #[test]
+    #[ignore = "slow: full prove + recursive fold on RISC-V trace; run with --release --ignored"]
+    fn riscv_recursive_full_scheme_rejects_tampered_evaluation() {
+        use metavm_zkp::prover::prove_chunk_with_scheme;
+        use metavm_zkp::recursive::{begin_chunk_full_scheme, verify_final_scheme};
+        use metavm_zkp::scheme::bls48581_scheme::Bls48581Scheme;
+        use metavm_zkp::scheme::CommitmentScheme;
+
+        let curve = metavm_zkp::field::CurveType::Bls48581;
+        let scheme = Bls48581Scheme::new();
+        scheme.init();
+
+        let columns = make_valid_trace(4);
+        let polys = super::trace_polys_from_columns(&columns);
+        let cs = RiscvConstraintSystem::full();
+
+        let zero = [0u8; 32];
+        let chunk_proof = prove_chunk_with_scheme(&polys, &cs, 0, &zero, &zero, &scheme);
+
+        // Sanity: untouched proof must verify with c_check folded in.
+        let recursive_ok = begin_chunk_full_scheme(chunk_proof.clone(), &scheme, curve, &cs);
+        assert!(
+            verify_final_scheme(&recursive_ok, &scheme),
+            "untouched RISC-V chunk must verify through full-scheme recursive accumulator",
+        );
+
+        // Tamper with a column evaluation. The constraint identity check
+        // `Q(z)·Z_H(z) - C(z)` must now be non-zero, so `scalar_acc` is
+        // non-zero and `verify_final_scheme` rejects.
+        let mut tampered = chunk_proof.clone();
+        assert!(
+            !tampered.execution_proof.evaluations.is_empty(),
+            "RISC-V proof must have evaluations to tamper with",
+        );
+        // Flip a low-order byte of the first column evaluation.
+        let target = &mut tampered.execution_proof.evaluations[0];
+        let last = target.len() - 1;
+        target[last] ^= 0x01;
+
+        let recursive_bad = begin_chunk_full_scheme(tampered, &scheme, curve, &cs);
+        assert!(
+            !verify_final_scheme(&recursive_bad, &scheme),
+            "RISC-V chunk with tampered evaluation MUST be rejected by the \
+             scalar_acc check",
+        );
+    }
 }

@@ -21,7 +21,29 @@ use crate::prover::ChunkProof;
 use crate::recursive::{RecursiveProof, AccumulatedClaim, begin_chunk};
 use bls48581::bls48581::big;
 use bls48581::bls48581::ecp;
+use bls48581::bls48581::rom;
 use metavm_core::transcript::Transcript;
+
+/// Combine two scalar accumulators from a tree fold step.
+///
+/// Empty side passes through (treats empty as "no scalar accumulation").
+/// Otherwise add the two scalars over the BLS48-581 scalar field. The byte
+/// format is BIG MODBYTES (big-endian).
+fn combine_scalar_accs(left: &[u8], right: &[u8]) -> Vec<u8> {
+    if left.is_empty() {
+        return right.to_vec();
+    }
+    if right.is_empty() {
+        return left.to_vec();
+    }
+    let modulus = big::BIG::new_ints(&rom::CURVE_ORDER);
+    let l = big::BIG::frombytes(left);
+    let r = big::BIG::frombytes(right);
+    let sum = big::BIG::modadd(&l, &r, &modulus);
+    let mut out = vec![0u8; big::MODBYTES];
+    sum.tobytes(&mut out);
+    out
+}
 
 /// Fold an iterator of chunk proofs into a single recursive proof using
 /// tree-structured aggregation.
@@ -150,6 +172,10 @@ fn fold_recursive_proofs(
         l_acc: l_bytes,
         r_acc: r_bytes_out,
         num_folded: left.accumulator.num_folded + right.accumulator.num_folded,
+        scalar_acc: combine_scalar_accs(
+            &left.accumulator.scalar_acc,
+            &right.accumulator.scalar_acc,
+        ),
     };
 
     Ok(RecursiveProof {
@@ -263,6 +289,10 @@ fn fold_recursive_proofs_scheme(
         l_acc: l_bytes,
         r_acc: r_bytes_out,
         num_folded: left.accumulator.num_folded + right.accumulator.num_folded,
+        scalar_acc: combine_scalar_accs(
+            &left.accumulator.scalar_acc,
+            &right.accumulator.scalar_acc,
+        ),
     };
 
     Ok(RecursiveProof {
@@ -360,6 +390,11 @@ mod tests {
                 logup_shifted_evaluations: Vec::new(),
                 logup_opening_proof: None,
                 logup_shifted_opening_proof: None,
+                bitwise_commitments: Vec::new(),
+                bitwise_evaluations: Vec::new(),
+                bitwise_shifted_evaluations: Vec::new(),
+                bitwise_opening_proof: None,
+                bitwise_shifted_opening_proof: None,
                 perm_commitments: Vec::new(),
                 perm_evaluations: Vec::new(),
                 perm_shifted_evaluations: Vec::new(),
@@ -371,6 +406,13 @@ mod tests {
                 reg_perm_shifted_evaluations: Vec::new(),
                 reg_perm_opening_proof: None,
                 reg_perm_shifted_opening_proof: None,
+                frame_perm_commitment: None,
+                frame_perm_evaluation: None,
+                frame_perm_shifted_evaluation: None,
+                frame_perm_opening_proof: None,
+                frame_perm_shifted_opening_proof: None,
+                frame_perm_pop_shifted_evaluations: Vec::new(),
+                frame_perm_pop_shifted_opening_proof: None,
             },
             initial_state_hash: initial,
             final_state_hash: final_h,
